@@ -152,6 +152,7 @@ class Computer {
   async leftClick(x, y) {
     this._validateCoords(x, y);
     const rx = Math.round(x), ry = Math.round(y);
+    console.log(`[computer-macos] leftClick(${rx}, ${ry}) via ${_hasCliclick ? 'cliclick' : 'AppleScript'}`);
     if (_hasCliclick) {
       execSync(`cliclick c:${rx},${ry}`, { timeout: 3000, stdio: 'pipe' });
     } else {
@@ -250,7 +251,16 @@ end tell`);
   async type(text) {
     const old = this._readClipboard();
     this._ensureTargetFocused();
+
+    // Write the exact text to clipboard — verify it took
     this._writeClipboard(text);
+    const verify = this._readClipboard();
+    if (verify !== text) {
+      console.warn(`[computer-macos] Clipboard write mismatch! Expected: "${text.slice(0, 30)}" Got: "${verify.slice(0, 30)}"`);
+      // Retry once
+      this._writeClipboard(text);
+      await new Promise((r) => setTimeout(r, 50));
+    }
 
     // Cmd+V to paste
     runOsascriptMultiline(`
@@ -259,7 +269,8 @@ tell application "System Events"
 end tell`);
 
     // Wait for paste to complete, then restore clipboard
-    await new Promise((r) => setTimeout(r, 100));
+    // 300ms to ensure paste finishes before we overwrite clipboard
+    await new Promise((r) => setTimeout(r, 300));
     if (old) {
       this._writeClipboard(old);
     } else {
@@ -275,8 +286,6 @@ end tell`);
   async key(keys) {
     const combo = keys.toLowerCase().trim();
     const parts = combo.split('+').map((p) => p.trim());
-
-    this._ensureTargetFocused();
 
     // Separate modifiers from the actual key
     const modifiers = [];
@@ -295,6 +304,18 @@ end tell`);
       return;
     }
 
+    // For enter/return, always re-focus target app right before sending
+    // to prevent the key going to the wrong window
+    const isEnterReturn = (mainKey === 'enter' || mainKey === 'return');
+    if (isEnterReturn) {
+      console.log(`[computer-macos] key(${keys}) — re-focusing target app before send key`);
+    }
+    this._ensureTargetFocused();
+    if (isEnterReturn && this._lastFocusedApp) {
+      // Extra small wait after re-focus to ensure the app is active
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
     // Check if the main key is a special key (Enter, Tab, etc.) or character
     const specialKeyCode = MAC_KEY_CODES[mainKey];
     const charKeyCode = MAC_CHAR_KEY_CODES[mainKey];
@@ -306,6 +327,9 @@ end tell`);
 tell application "System Events"
   key code ${specialKeyCode}${modStr}
 end tell`);
+      if (isEnterReturn) {
+        console.log(`[computer-macos] key(${keys}) — sent key code ${specialKeyCode} to "${this._lastFocusedApp || 'unknown'}"`);
+      }
     } else if (mainKey.length === 1) {
       // Single character — use keystroke
       const modStr = modifiers.length > 0 ? ` using {${modifiers.join(', ')}}` : '';

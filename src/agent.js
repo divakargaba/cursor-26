@@ -4,8 +4,11 @@ require('dotenv').config();
 const Anthropic = require('@anthropic-ai/sdk');
 const crypto = require('crypto');
 
+const { clipboard } = require('electron');
 const Memory = require('./memory');
 const { overlayGrid, resolveCell } = require('./grid-overlay');
+
+const CHROME_RESTART_CMD = 'open -na "Google Chrome" --args --remote-debugging-port=9222';
 
 const MODEL = 'claude-haiku-4-5-20251001';
 const MAX_TOKENS = 4096;
@@ -28,7 +31,7 @@ const tools = [
     input_schema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['navigate', 'read_page', 'click_selector', 'click_text', 'type', 'scroll', 'press_key'] },
+        action: { type: 'string', enum: ['navigate', 'read_page', 'click_selector', 'click_text', 'type', 'scroll', 'press_key', 'list_tabs', 'switch_tab'] },
         url: { type: 'string' },
         selector: { type: 'string' },
         text: { type: 'string' },
@@ -51,6 +54,7 @@ const tools = [
         x: { type: 'number' },
         y: { type: 'number' },
         cell: { type: 'string', description: 'Grid cell label from screenshot (e.g. "F4", "B2"). Preferred over x/y.' },
+        key: { type: 'string', description: 'Key or combo for key action (e.g. "enter", "command+k", "ctrl+c").' },
         command: { type: 'string' },
       },
       required: ['action'],
@@ -101,37 +105,66 @@ FOCUS MANAGEMENT — CRITICAL:
 - Without focus_window, keystrokes go to the WRONG window.
 
 CLICK TARGETING — 3-TIER SYSTEM (never guess coordinates):
-Tier 1 — ELEMENT NAMES (best): read_screen returns UI elements with exact coordinates from Windows UIAutomation.
+Tier 1 — ELEMENT NAMES (best for Windows): read_screen returns UI elements with exact coordinates.
   - Use target="button name" to click elements by name — pixel-perfect accuracy.
-  - Always try read_screen FIRST for native apps.
-Tier 2 — GRID CELLS (good): take_screenshot returns an image with a labeled grid (A1 through L8, 12 cols × 8 rows).
+  - On macOS, read_screen returns empty (no AX API yet). Skip to Tier 2.
+Tier 2 — GRID CELLS (primary on macOS): take_screenshot returns an image with a labeled grid (A1 through L8, 12 cols × 8 rows).
   - Use cell="F4" in native_action click — maps to the center of that grid cell.
   - Sub-cell: append -TL, -TR, -BL, -BR (e.g. cell="F4-TL" for top-left quarter).
-  - Use this when read_screen finds no elements (Electron/custom UI apps).
+  - ALWAYS take a screenshot BEFORE clicking in an unfamiliar UI. Don't guess cells from memory.
 Tier 3 — RAW COORDINATES (last resort): Only use x/y if tiers 1 and 2 fail.
-  - NEVER guess coordinates from a screenshot image. ALWAYS derive them from read_screen elements or grid cells.
+  - NEVER guess coordinates. ALWAYS derive them from read_screen elements or grid cells.
 
-CLICK VERIFICATION:
-- After every click, the result tells you the active window title. Check it changed as expected.
-- If clicking didn't change anything (same window title, no expected result), DON'T retry the same click.
-- Instead: try a DIFFERENT approach — keyboard shortcut, different element, or ask the user.
-- If you've clicked 2+ times with no progress, take_screenshot to see what actually happened.
+CLICK VERIFICATION — READ YOUR RESULTS:
+- Every click result tells you the window title and whether it changed. READ IT.
+- If the result says "(unchanged)" and you expected a change, the click MISSED. Do NOT retry the same click.
+- Instead: take_screenshot to see what actually happened, then try a different cell, keyboard shortcut, or approach.
+- RULE OF TWO: If you tried 2 similar actions (same tool, similar target) and neither worked, STOP. Take a screenshot or try a completely different method (keyboard shortcut, different selector, etc.).
+
+WHEN TO TAKE A SCREENSHOT:
+- When you need to click something and you don't have element names (macOS) or a recent grid.
+- When a click result says "(unchanged)" — see what's actually on screen.
+- When context is empty or you're in an unfamiliar window.
+- When you're not sure what app or screen is in the foreground.
+- Do NOT guess what's on screen. If you're unsure, screenshot first, then act.
+
+BATCHING vs VERIFICATION:
+- For KNOWN sequences (keyboard shortcuts like Discord: focus + Cmd+K + type + Enter + type + Enter), batch all in one response. These don't need visual verification.
+- For VISUAL/CLICK tasks (clicking UI elements, navigating unfamiliar screens), send 1-2 actions at a time and CHECK the results before continuing. You can't verify a click landed correctly if you've already queued 5 more actions after it.
 
 BROWSER (browser_action):
 - Use for ANYTHING in a browser. It's instant via CDP — no screenshots needed.
 - Chrome is auto-connected via CDP. If not connected, it will auto-launch.
-- After navigate: read_page in the SAME response or next one.
-- read_page gives you the full DOM — use element IDs, selectors, or text to target clicks/types.
-- click_selector and click_text are PRECISE — they use CSS selectors, not coordinates.
+- TAB MANAGEMENT: Use list_tabs to see all open tabs. Use switch_tab(url="pattern") to switch to a specific tab BEFORE read_page/click. read_page reads ONLY the currently active tab — if the wrong tab is active, you'll get the wrong page.
+- If the user says they're already on a site (e.g. "I'm on Discord"), use switch_tab to find that tab — do NOT use navigate (which opens a new tab).
+- After navigate: ALWAYS call read_page to see what's on the page before clicking or typing.
+- NEVER guess selectors or element text. Use read_page first, then pick from the actual elements returned.
+- click_selector and click_text are PRECISE — but only if you use selectors/text from read_page results.
+- If navigation or read_page fails, tell the user. Do NOT claim you found or did something.
 
 ELECTRON APPS (Discord, Spotify, Slack, VS Code, Figma, Notion, WhatsApp, Obsidian, Teams):
 - Use native_action with keyboard shortcuts. CDP is NOT available for these.
 - KEYBOARD SHORTCUTS are fast and reliable for Electron apps:
-  - Discord: Ctrl+K opens quick switcher, type channel/user name, Enter to select, then type message, then Enter TO SEND.
-  - Spotify: Ctrl+K for search. Space to play/pause.
-  - Slack: Ctrl+K for quick switcher, type channel name, Enter.
-- ALWAYS press Enter after typing a message to SEND it. Typing without Enter just leaves text in the box.
+  - Discord: Ctrl+K opens quick switcher (on macOS: Command+K), type channel/user name, Enter to select, then type message, then Enter TO SEND.
+  - Spotify: Ctrl+K for search (macOS: Command+K). Space to play/pause.
+  - Slack: Ctrl+K for quick switcher (macOS: Command+K), type channel name, Enter.
+  - On macOS, use key(command+k) where Windows uses key(ctrl+k) for quick switcher shortcuts.
+
+*** CRITICAL — SENDING CHAT MESSAGES ***
+In Discord, Slack, WhatsApp, Teams, or ANY chat app, typing only puts text in the input box.
+You MUST call key(enter) or key(return) as the VERY LAST action to actually SEND the message.
+NEVER end a send-message flow with type(...) alone — the message will sit unsent in the box.
+  WRONG: focus_window(Discord) → key(ctrl+k) → type(general) → key(enter) → type(message) ← STOPS HERE, MESSAGE NOT SENT!
+  RIGHT: focus_window(Discord) → key(ctrl+k) → type(general) → key(enter) → type(message) → key(enter) ← SENDS!
+- After type(message), the VERY NEXT tool call MUST be key(enter) or key(return). Do not click, scroll, screenshot, or do anything else between type and key(enter).
+- If you hit the action limit and the last thing you did was type(message), your next response MUST start with key(enter) — nothing else first.
+- To send, use exactly key(enter) or key(return). Both work on macOS. No other key name ("Send", "Submit") will work.
 - Full sequence for "send X in Discord #general": focus_window(Discord) → key(ctrl+k) → type(general) → key(enter) → type(X) → key(enter).
+
+MESSAGE TEXT — USE ONLY WHAT THE USER ASKED:
+- When sending a message, use ONLY the exact message text the user asked you to send.
+- Never use the user's clipboard content or any pre-filled text as the message.
+- If the user says "send 'hello world'", type exactly "hello world" — nothing else.
 
 NATIVE APPS (native_action):
 - For non-browser, non-Electron apps (Notepad, File Explorer, Excel, etc.)
@@ -141,12 +174,48 @@ NATIVE APPS (native_action):
 - run_command to open apps.
 
 SCREENSHOT (take_screenshot):
-- Returns a grid-labeled screenshot. Use the grid labels (A1-L8) to identify click targets.
-- After getting a screenshot, use cell="A3" in native_action click, not raw pixel guesses.
-- Grid cells are ~160x135 pixels each. For precise targeting, use sub-cell (-TL, -TR, -BL, -BR).
+- Returns a grid-labeled screenshot (A1-L8). Look at the image carefully to identify the right cell.
+- After getting a screenshot, use cell="A3" in native_action click — not raw pixel guesses.
+- Grid cells are ~160x135 pixels each. Use sub-cell (-TL, -TR, -BL, -BR) for precision.
+- This is your primary way to find click targets on macOS (read_screen is unavailable).
+- The overlay panel is automatically hidden before screenshots and clicks, so it won't block your view or intercept clicks. Don't worry about it.
 
 CONFIRMATIONS (request_confirmation):
 - ALWAYS before send/submit/delete/purchase. Never skip.
+
+BROWSER SEARCH (e.g. "search Google for X", "look up X"):
+- Use browser_action navigate to https://www.google.com/search?q=URL_ENCODED_QUERY — this is the fastest, single-step approach.
+- Alternatively: navigate to google.com, then type into the search input, then press_key Enter. But the direct URL is preferred.
+- After navigate, call read_page in the SAME response to get the results.
+- If the browser is not connected or navigation fails, TELL THE USER ("I couldn't connect to Chrome" etc.) — do NOT say "I searched for X" if you didn't.
+
+DISCORD IN BROWSER (user uses Discord in Chrome, NOT the desktop app):
+- CDP (browser_action) is the ONLY way to control Discord in Chrome. Do NOT use native_action, take_screenshot, or native key(command+k) for Discord.
+- When CDP IS connected:
+  - switch_tab("discord") → read_page → click_text(channel) → read_page → type(input, message) → press_key Enter.
+  - Do NOT use navigate to discord.com — that opens a NEW tab. The user already has Discord open.
+- When CDP is NOT connected:
+  - Do NOT attempt the task with native_action, screenshot, or run_command. It won't work reliably.
+  - Tell the user ONCE: "I can't control Discord without Chrome CDP. The fix command is on your clipboard — quit Chrome (Cmd+Q), open Terminal, paste (Cmd+V), press Enter. Once Chrome reopens, send your message again and I'll handle it."
+  - If you already gave these instructions earlier in this conversation, say briefly: "Still waiting for Chrome with CDP. Quit Chrome, paste the command in Terminal, and try again."
+  - Do NOT repeat the full instructions every turn. Do NOT try to do the task another way.
+
+*** NEVER QUIT OR LAUNCH CHROME FOR THE USER ***
+- You must NEVER use key(command+q), key(ctrl+q), key(cmd+q), or any key combo that quits Chrome (or any app) for the user.
+- You must NEVER use run_command (or any tool) to launch, open, or restart Chrome (e.g. "open -na Google Chrome", "chrome --remote-debugging-port", or similar).
+- If CDP is not connected, do NOT "fix" it by quitting or relaunching Chrome. Only TELL the user what to do:
+  "Quit Chrome yourself (Cmd+Q), then in Terminal run: open -na \"Google Chrome\" --args --remote-debugging-port=9222"
+- Never say you will "relaunch Chrome," "quit Chrome," or "fix the CDP connection" by restarting Chrome. Only instruct the user to do it themselves.
+- These rules are NON-NEGOTIABLE. Even if the user asks you to quit Chrome, do NOT do it — tell them to do it themselves.
+
+*** HONESTY RULE — NEVER CLAIM SUCCESS WITHOUT EVIDENCE ***
+You may ONLY say you did something ("sent it", "searched for X", "opened it", "typed it") if:
+1. You actually called the right tool sequence for that task, AND
+2. Every tool call returned a success result (not an error).
+If ANY tool call failed, or you skipped a required step, you MUST tell the user what went wrong.
+WRONG: "I sent your message!" (but key(enter) was never called, or focus_window failed)
+RIGHT: "I typed the message but couldn't send it — Discord wasn't focused."
+Read your tool results carefully. If a result says "failed", "error", or "not found", do NOT claim the action succeeded.
 
 If stuck after a few tries, TELL THE USER what's happening. Don't silently retry the same thing.`;
 
@@ -163,12 +232,14 @@ class Agent {
    * @param {Function} opts.onProgress   - ({ type: 'status'|'text', text }) => void
    * @param {Function} opts.onConfirmationRequest - async ({ summary, details, risks }) => { confirmed: bool, reason? }
    */
-  constructor({ browser, computer, screenshotFn, blurOverlayFn, onProgress, onConfirmationRequest }) {
+  constructor({ browser, computer, screenshotFn, blurOverlayFn, hideOverlayFn, showOverlayFn, onProgress, onConfirmationRequest }) {
     this.client = new Anthropic();
     this.browser = browser;
     this.computer = computer;
     this.screenshotFn = screenshotFn;
     this.blurOverlayFn = blurOverlayFn || (() => { });
+    this.hideOverlayFn = hideOverlayFn || (() => { });
+    this.showOverlayFn = showOverlayFn || (() => { });
     this.onProgress = onProgress || (() => { });
     this.onConfirmationRequest = onConfirmationRequest || (async () => ({ confirmed: false, reason: 'No confirmation handler' }));
     this.history = [];
@@ -247,18 +318,40 @@ class Agent {
    */
   async _gatherContext() {
     // 1. Try Chrome browser context (CDP — instant structured data)
+    let cdpStatus = '';
     try {
       if (this.browser && typeof this.browser.isConnected === 'function' && this.browser.isConnected()) {
         const pageCtx = await this.browser.getPageContext();
         if (pageCtx) {
+          const elemSummary = pageCtx.elements.slice(0, 30).map((e) => {
+            const p = [e.tag];
+            if (e.text) p.push(`"${e.text.slice(0, 60)}"`);
+            if (e.id) p.push(`#${e.id}`);
+            if (e.role) p.push(`role=${e.role}`);
+            return p.join(' ');
+          }).join('\n');
+          const more = pageCtx.elements.length > 30 ? `\n(${pageCtx.elements.length - 30} more elements — call read_page for full list)` : '';
           return {
             type: 'browser',
-            text: `[Browser] URL: ${pageCtx.url}\nTitle: ${pageCtx.title}\nElements (${pageCtx.elements.length}): ${JSON.stringify(pageCtx.elements.slice(0, 80))}`,
+            text: `[Browser: CDP connected] URL: ${pageCtx.url}\nTitle: ${pageCtx.title}\nElements:\n${elemSummary}${more}`,
           };
+        }
+      } else {
+        // CDP not connected — capture reason, copy restart command to clipboard
+        const reason = (this.browser && typeof this.browser.getLastCDPFailReason === 'function')
+          ? this.browser.getLastCDPFailReason()
+          : 'not connected';
+        cdpStatus = `[Browser: CDP NOT connected. ${reason || 'Unknown reason'}. The Chrome restart command is on the user's clipboard. If the user asks to do something in Chrome/Discord, tell them ONCE to quit Chrome (Cmd+Q), open Terminal, paste (Cmd+V), press Enter, then send their message again. Do NOT attempt browser tasks with native_action.]`;
+        try {
+          clipboard.writeText(CHROME_RESTART_CMD);
+          console.log('[agent] Copied Chrome restart command to clipboard');
+        } catch (clipErr) {
+          console.warn('[agent] Could not copy to clipboard:', clipErr.message);
         }
       }
     } catch (err) {
       console.error('[agent] browser context error:', err.message);
+      cdpStatus = `[Browser: CDP error — ${err.message}]`;
     }
 
     // 2. Try Electron app CDP — detect focused app, try connectToApp
@@ -269,9 +362,17 @@ class Agent {
           this._activeElectronApp = detected.appName;
           const appCtx = await this.browser.getAppPageContext(detected.appName);
           if (appCtx) {
+            const appElemSummary = appCtx.elements.slice(0, 30).map((e) => {
+              const p = [e.tag];
+              if (e.text) p.push(`"${e.text.slice(0, 60)}"`);
+              if (e.id) p.push(`#${e.id}`);
+              if (e.role) p.push(`role=${e.role}`);
+              return p.join(' ');
+            }).join('\n');
+            const appMore = appCtx.elements.length > 30 ? `\n(${appCtx.elements.length - 30} more — call read_page for full list)` : '';
             return {
               type: 'electron-cdp',
-              text: `[Electron CDP: ${detected.appName}] URL: ${appCtx.url}\nTitle: ${appCtx.title}\nElements (${appCtx.elements.length}): ${JSON.stringify(appCtx.elements.slice(0, 80))}\n\nThis is an Electron app connected via CDP — browser_action tools work here.`,
+              text: `[Electron CDP: ${detected.appName}] URL: ${appCtx.url}\nTitle: ${appCtx.title}\nElements:\n${appElemSummary}${appMore}\n\nThis is an Electron app connected via CDP — browser_action tools work here.`,
             };
           }
         }
@@ -290,7 +391,7 @@ class Agent {
           );
           return {
             type: 'native',
-            text: `[Native app] Window: ${uiInfo.window}\nElements (${uiInfo.elements.length}):\n${rows.join('\n')}`,
+            text: `${cdpStatus ? cdpStatus + '\n' : ''}[Native app] Window: ${uiInfo.window}\nElements (${uiInfo.elements.length}):\n${rows.join('\n')}`,
           };
         }
       }
@@ -306,7 +407,7 @@ class Agent {
           const list = windows.map((w) => `  [${w.ProcessName}] ${w.MainWindowTitle}`).join('\n');
           return {
             type: 'windows',
-            text: `[No browser/native context. Open windows:]\n${list}\n\nUse native_action run_command to open/focus apps. Use keyboard shortcuts to navigate within apps. Call take_screenshot ONLY if you truly need to see the screen.`,
+            text: `${cdpStatus ? cdpStatus + '\n' : ''}[Open windows:]\n${list}\n\nUse native_action run_command to open/focus apps. Use keyboard shortcuts to navigate within apps. Call take_screenshot ONLY if you truly need to see the screen.`,
           };
         }
       }
@@ -316,7 +417,7 @@ class Agent {
 
     return {
       type: 'none',
-      text: '[No context available. Use native_action run_command to open apps, keyboard shortcuts to navigate. Call take_screenshot only if needed.]',
+      text: `${cdpStatus ? cdpStatus + '\n' : ''}[No context available. Use native_action run_command to open apps, keyboard shortcuts to navigate. Call take_screenshot only if needed.]`,
     };
   }
 
@@ -326,6 +427,17 @@ class Agent {
 
   async chat(text) {
     this.onProgress({ type: 'status', text: 'Reading screen...' });
+
+    // Retry CDP connection on every message — if user restarted Chrome with debug flag, we pick it up
+    if (this.browser && typeof this.browser.isConnected === 'function' && !this.browser.isConnected()) {
+      if (typeof this.browser.connectToChrome === 'function') {
+        console.log('[agent] CDP not connected — retrying...');
+        const ok = await this.browser.connectToChrome();
+        if (ok) {
+          console.log('[agent] CDP reconnected on retry!');
+        }
+      }
+    }
 
     this._currentActions = [];
     const ctx = await this._gatherContext();
@@ -406,7 +518,13 @@ class Agent {
 
         // Inter-action delay: apps need time to process previous actions
         if (i > 0 && (tu.name === 'native_action' || toolUses[i - 1].name === 'native_action')) {
-          await new Promise((r) => setTimeout(r, 150));
+          // Longer delay before key(enter/return) after type() — pasted text needs time to render
+          const prev = toolUses[i - 1];
+          const prevWasType = prev.name === 'native_action' && prev.input?.action === 'type';
+          const thisIsEnter = tu.name === 'native_action' && tu.input?.action === 'key' &&
+            /^(enter|return)$/i.test((tu.input.value || tu.input.target || '').trim());
+          const delay = (prevWasType && thisIsEnter) ? 350 : 150;
+          await new Promise((r) => setTimeout(r, delay));
         }
 
         this.onProgress({ type: 'status', text: this._toolLabel(tu) });
@@ -433,10 +551,18 @@ class Agent {
           result.unshift({ type: 'text', text: loopCheck.message });
         }
 
+        // Detect if tool result contains an error — mark is_error so the model sees it clearly
+        const resultText = result.filter((r) => r.type === 'text').map((r) => r.text).join(' ').toLowerCase();
+        const isToolError = resultText.includes('failed') || resultText.includes('error') ||
+          resultText.includes('could not') || resultText.includes('not found') ||
+          resultText.includes('not available') ||
+          resultText.includes('no browser connection') || resultText.includes('no page available');
+
         toolResults.push({
           type: 'tool_result',
           tool_use_id: tu.id,
           content: result,
+          ...(isToolError ? { is_error: true } : {}),
         });
       }
 
@@ -451,6 +577,11 @@ class Agent {
           });
         }
       }
+
+      // Log turn summary
+      const okCount = toolResults.filter((r) => !r.is_error).length;
+      const errCount = toolResults.filter((r) => r.is_error).length;
+      console.log(`[agent] Turn ${iterations}: ${toolUses.length} tools called, ${okCount} ok, ${errCount} errors`);
 
       this.history.push({ role: 'user', content: toolResults });
       this.onProgress({ type: 'status', text: 'Thinking...' });
@@ -473,22 +604,65 @@ class Agent {
   // Tool execution
   // =========================================================================
 
+  _logToolCall(name, input) {
+    const parts = [name];
+    if (name === 'browser_action') {
+      parts.push(input.action || '?');
+      if (input.url) parts.push(`url=${input.url.slice(0, 60)}`);
+      if (input.selector) parts.push(`sel=${input.selector.slice(0, 40)}`);
+      if (input.text) parts.push(`text="${input.text.slice(0, 30)}"`);
+      if (input.key) parts.push(`key=${input.key}`);
+    } else if (name === 'native_action') {
+      parts.push(input.action || '?');
+      if (input.target) parts.push(`target="${input.target.slice(0, 30)}"`);
+      if (input.value) parts.push(`value="${input.value.slice(0, 30)}"`);
+      if (input.cell) parts.push(`cell=${input.cell}`);
+      if (input.key) parts.push(`key=${input.key}`);
+      if (input.command) parts.push(`cmd="${input.command.slice(0, 40)}"`);
+    }
+    console.log(`[tool] EXEC ${parts.join(' ')}`);
+  }
+
+  _logToolResult(name, result) {
+    // Extract first text content from result array
+    const firstText = result.find((r) => r.type === 'text');
+    const snippet = firstText ? firstText.text.slice(0, 120) : '(no text)';
+    const hasError = snippet.toLowerCase().includes('failed') ||
+      snippet.toLowerCase().includes('error') ||
+      snippet.toLowerCase().includes('could not') ||
+      snippet.toLowerCase().includes('no browser') ||
+      snippet.toLowerCase().includes('not found') ||
+      snippet.toLowerCase().includes('not available');
+    const tag = hasError ? 'FAIL' : 'OK';
+    console.log(`[tool] ${tag}   ${name} → ${snippet}`);
+  }
+
   async _executeTool(name, input) {
+    this._logToolCall(name, input);
     try {
+      let result;
       switch (name) {
         case 'browser_action':
-          return await this._execBrowserAction(input);
+          result = await this._execBrowserAction(input);
+          break;
         case 'native_action':
-          return await this._execNativeAction(input);
+          result = await this._execNativeAction(input);
+          break;
         case 'take_screenshot':
-          return await this._execScreenshot();
+          result = await this._execScreenshot();
+          break;
         case 'request_confirmation':
-          return await this._execConfirmation(input);
+          result = await this._execConfirmation(input);
+          break;
         default:
-          return [{ type: 'text', text: `Unknown tool: ${name}` }];
+          result = [{ type: 'text', text: `Unknown tool: ${name}` }];
       }
+      this._logToolResult(name, result);
+      return result;
     } catch (err) {
-      return [{ type: 'text', text: `Error executing ${name}: ${err.message}` }];
+      const errResult = [{ type: 'text', text: `Error executing ${name}: ${err.message}` }];
+      console.log(`[tool] ERROR ${name} → ${err.message}`);
+      return errResult;
     }
   }
 
@@ -501,21 +675,22 @@ class Agent {
       return [{ type: 'text', text: 'Browser module not available.' }];
     }
 
-    // Auto-connect if needed — auto-launch Chrome with CDP if necessary
+    // Connect-only; never launches or relaunches Chrome.
     if (typeof this.browser.isConnected === 'function' && !this.browser.isConnected()) {
       if (typeof this.browser.autoConnectOrLaunchChrome === 'function') {
         this.onProgress({ type: 'status', text: 'Connecting to Chrome...' });
         const result = await this.browser.autoConnectOrLaunchChrome();
         if (!result.connected) {
+          console.log(`[browser] CDP connect failed: ${result.message}`);
           // Try Electron app CDP if Chrome isn't available
           if (this._activeElectronApp) {
             const appCtx = await this.browser.getAppPageContext(this._activeElectronApp);
             if (!appCtx) {
-              return [{ type: 'text', text: `No browser connection. ${result.message}` }];
+              console.log(`[browser] Electron CDP also failed for ${this._activeElectronApp}`);
+              return [{ type: 'text', text: `Could not connect to Chrome via CDP. ${result.message}. Make sure Chrome is running.` }];
             }
-            // Route to Electron app page
           } else {
-            return [{ type: 'text', text: result.message }];
+            return [{ type: 'text', text: `Could not connect to Chrome via CDP. ${result.message}. Make sure Chrome is running.` }];
           }
         }
       }
@@ -531,14 +706,15 @@ class Agent {
         }
         const ctx = await this.browser.getPageContext();
         if (ctx) {
-          const elemSummary = ctx.elements.slice(0, 60).map((e) => {
+          const elemSummary = ctx.elements.slice(0, 40).map((e) => {
             const parts = [e.tag];
-            if (e.text) parts.push(`"${e.text}"`);
+            if (e.text) parts.push(`"${e.text.slice(0, 80)}"`);
             if (e.id) parts.push(`#${e.id}`);
             if (e.role) parts.push(`role=${e.role}`);
             return parts.join(' ');
           }).join('\n');
-          return [{ type: 'text', text: `Navigated to ${input.url}\nURL: ${ctx.url}\nTitle: ${ctx.title}\nElements:\n${elemSummary}` }];
+          const moreNote = ctx.elements.length > 40 ? `\n(${ctx.elements.length - 40} more — call read_page if needed)` : '';
+          return [{ type: 'text', text: `Navigated to ${input.url}\nURL: ${ctx.url}\nTitle: ${ctx.title}\nElements:\n${elemSummary}${moreNote}` }];
         }
         return [{ type: 'text', text: `Navigated to ${input.url}` }];
       }
@@ -597,6 +773,21 @@ class Agent {
         return [{ type: 'text', text: `Pressed ${input.key}` }];
       }
 
+      case 'list_tabs': {
+        const tabs = await this.browser.listTabs();
+        if (tabs.length === 0) return [{ type: 'text', text: 'No open tabs found (or not connected to Chrome).' }];
+        const tabList = tabs.map((t, i) => `  [${i}] ${t.title} — ${t.url.slice(0, 100)}`).join('\n');
+        return [{ type: 'text', text: `Open tabs (${tabs.length}):\n${tabList}\n\nUse switch_tab with a URL or title pattern to switch to a tab.` }];
+      }
+
+      case 'switch_tab': {
+        const pattern = input.url || input.text || input.value || '';
+        if (!pattern) return [{ type: 'text', text: 'switch_tab requires a url or text pattern (e.g. "discord", "github.com").' }];
+        const res = await this.browser.switchToTab(pattern);
+        if (!res.ok) return [{ type: 'text', text: `Switch tab failed: ${res.error}` }];
+        return [{ type: 'text', text: `Switched to tab: ${res.title} — ${res.url.slice(0, 100)}` }];
+      }
+
       default:
         return [{ type: 'text', text: `Unknown browser_action: ${action}` }];
     }
@@ -629,27 +820,34 @@ class Agent {
       }
 
       case 'click': {
+        // Hide overlay before clicking so it doesn't intercept the click
+        this.hideOverlayFn();
+        await new Promise((r) => setTimeout(r, 150));
+
         // Capture pre-click state for verification
         const preClickTitle = this.computer.getForegroundWindowTitle();
+
+        let clickResult;
 
         // Priority 1: Grid cell label (from screenshot overlay)
         if (input.cell && this._lastGridMap) {
           const resolved = resolveCell(this._lastGridMap, input.cell);
           if (resolved) {
+            console.log(`[click] Grid cell ${input.cell} → logical (${resolved.x}, ${resolved.y})`);
             await this.computer.leftClick(resolved.x, resolved.y);
             await new Promise((r) => setTimeout(r, 100));
             const postTitle = this.computer.getForegroundWindowTitle();
             const changed = postTitle !== preClickTitle ? ` Window changed to: "${postTitle}"` : ` Window: "${postTitle}" (unchanged)`;
-            return [{ type: 'text', text: `Clicked grid cell ${input.cell} at (${resolved.x}, ${resolved.y}).${changed}` }];
+            clickResult = [{ type: 'text', text: `Clicked grid cell ${input.cell} at (${resolved.x}, ${resolved.y}).${changed}` }];
+          } else {
+            clickResult = [{ type: 'text', text: `Grid cell "${input.cell}" not found. Valid cells: A1-L8. Take a new screenshot to get fresh grid.` }];
           }
-          return [{ type: 'text', text: `Grid cell "${input.cell}" not found. Valid cells: A1-L8. Take a new screenshot to get fresh grid.` }];
         }
 
         // Priority 2: Target name (UIAutomation element lookup) — before raw coords
-        if (input.target) {
+        if (!clickResult && input.target) {
           const uiInfo = await this.computer.getUIElements();
           const targetLower = input.target.toLowerCase();
-          // Try exact match first, then substring match
           let match = (uiInfo.elements || []).find((e) =>
             e.name && e.name.toLowerCase() === targetLower
           );
@@ -663,38 +861,70 @@ class Agent {
             await new Promise((r) => setTimeout(r, 100));
             const postTitle = this.computer.getForegroundWindowTitle();
             const changed = postTitle !== preClickTitle ? ` Window changed to: "${postTitle}"` : '';
-            return [{ type: 'text', text: `Clicked "${match.name}" [${match.type}] at (${match.x}, ${match.y}).${changed}` }];
+            clickResult = [{ type: 'text', text: `Clicked "${match.name}" [${match.type}] at (${match.x}, ${match.y}).${changed}` }];
+          } else {
+            const hint = this._lastGridMap
+              ? ' Take a screenshot and use grid cell labels for precise clicking.'
+              : ' Try take_screenshot to see the screen and use grid cell labels.';
+            clickResult = [{ type: 'text', text: `Could not find element matching "${input.target}".${hint} Available elements: ${(uiInfo.elements || []).slice(0, 10).map(e => `"${e.name}" (${e.type})`).join(', ') || 'none detected'}` }];
           }
-          const hint = this._lastGridMap
-            ? ' Take a screenshot and use grid cell labels for precise clicking.'
-            : ' Try take_screenshot to see the screen and use grid cell labels.';
-          return [{ type: 'text', text: `Could not find element matching "${input.target}".${hint} Available elements: ${(uiInfo.elements || []).slice(0, 10).map(e => `"${e.name}" (${e.type})`).join(', ') || 'none detected'}` }];
         }
 
         // Priority 3: Raw coordinates (last resort)
-        if (input.x !== undefined && input.y !== undefined) {
+        if (!clickResult && input.x !== undefined && input.y !== undefined) {
+          console.log(`[click] Raw coordinates (${input.x}, ${input.y})`);
           await this.computer.leftClick(input.x, input.y);
           await new Promise((r) => setTimeout(r, 100));
           const postTitle = this.computer.getForegroundWindowTitle();
           const changed = postTitle !== preClickTitle ? ` Window changed to: "${postTitle}"` : ` Window: "${postTitle}" (unchanged)`;
-          return [{ type: 'text', text: `Clicked at (${input.x}, ${input.y}).${changed} NOTE: Raw coordinates are unreliable. Prefer target="name" or cell="F4" from grid.` }];
+          clickResult = [{ type: 'text', text: `Clicked at (${input.x}, ${input.y}).${changed} NOTE: Raw coordinates are unreliable. Prefer target="name" or cell="F4" from grid.` }];
         }
 
-        return [{ type: 'text', text: 'click requires cell (grid label), target (element name), or x/y coordinates.' }];
+        if (!clickResult) {
+          clickResult = [{ type: 'text', text: 'click requires cell (grid label), target (element name), or x/y coordinates.' }];
+        }
+
+        // Re-show overlay after click
+        this.showOverlayFn();
+        return clickResult;
       }
 
       case 'type': {
+        // Only use the explicit value from tool input — never clipboard or other sources
         const val = input.value || input.target || '';
         if (!val) return [{ type: 'text', text: 'type requires a value.' }];
         await this.computer.type(val);
-        return [{ type: 'text', text: `Typed "${val.slice(0, 50)}${val.length > 50 ? '...' : ''}"` }];
+
+        // If this looks like a chat message, remind model to send with key(enter)
+        const isChatContext = this._looksLikeChatSend();
+        const sendReminder = isChatContext
+          ? ' [You MUST call key(enter) or key(return) next to send this message. Do not click, scroll, or do anything else before sending.]'
+          : '';
+        return [{ type: 'text', text: `Typed "${val.slice(0, 50)}${val.length > 50 ? '...' : ''}"${sendReminder}` }];
       }
 
       case 'key': {
-        const keys = input.value || input.target || '';
+        const keys = input.value || input.target || input.key || '';
         if (!keys) return [{ type: 'text', text: 'key requires a value (e.g. "ctrl+c", "enter").' }];
-        await this.computer.key(keys);
-        return [{ type: 'text', text: `Pressed ${keys}` }];
+
+        // GUARD: Block quit-app combos (command+q, ctrl+q, cmd+q) if foreground is Chrome
+        const keysLower = keys.toLowerCase().replace(/\s/g, '');
+        const isQuitCombo = /^(command|cmd|ctrl)\+q$/.test(keysLower);
+        if (isQuitCombo) {
+          const fgTitle = (this.computer.getForegroundWindowTitle() || '').toLowerCase();
+          if (fgTitle.includes('chrome') || fgTitle.includes('google chrome')) {
+            console.log(`[agent] BLOCKED key(${keys}) — would quit Chrome`);
+            return [{ type: 'text', text: 'BLOCKED: The assistant must not quit Chrome for the user. Tell the user to quit Chrome themselves (Cmd+Q) and reopen with: open -na "Google Chrome" --args --remote-debugging-port=9222' }];
+          }
+        }
+
+        try {
+          await this.computer.key(keys);
+          return [{ type: 'text', text: `Pressed ${keys}` }];
+        } catch (keyErr) {
+          console.log(`[agent] key(${keys}) error: ${keyErr.message}`);
+          return [{ type: 'text', text: `Key "${keys}" failed: ${keyErr.message}. To send a message, use key(enter) or key(return) — both work on macOS.` }];
+        }
       }
 
       case 'scroll': {
@@ -708,6 +938,18 @@ class Agent {
       case 'run_command': {
         const cmd = input.command || input.value || '';
         if (!cmd) return [{ type: 'text', text: 'run_command requires a command.' }];
+
+        // GUARD: Block commands that launch, restart, or kill Chrome
+        const cmdLower = cmd.toLowerCase();
+        const launchesChrome = (cmdLower.includes('chrome') || cmdLower.includes('google chrome')) &&
+          (cmdLower.includes('open') || cmdLower.includes('start') || cmdLower.includes('remote-debugging') || cmdLower.includes('9222'));
+        const killsChrome = (cmdLower.includes('chrome') || cmdLower.includes('google chrome')) &&
+          (cmdLower.includes('kill') || cmdLower.includes('taskkill') || cmdLower.includes('pkill') || cmdLower.includes('quit'));
+        if (launchesChrome || killsChrome) {
+          console.log(`[agent] BLOCKED run_command — would launch/kill Chrome: ${cmd.slice(0, 80)}`);
+          return [{ type: 'text', text: 'BLOCKED: The assistant must not launch, restart, or kill Chrome. Tell the user to do it themselves: quit Chrome (Cmd+Q), then run in Terminal: open -na "Google Chrome" --args --remote-debugging-port=9222' }];
+        }
+
         const result = await this.computer.runCommand(cmd);
         const parts = [];
         if (result.stdout) parts.push(`stdout: ${result.stdout}`);
@@ -752,12 +994,42 @@ class Agent {
   // --- take_screenshot ---
 
   async _execScreenshot() {
+    // Hide overlay so it doesn't appear in the screenshot
+    this.hideOverlayFn();
+    await new Promise((r) => setTimeout(r, 200));
+
     const ss = await this.screenshotFn();
+
+    // Re-show overlay after capture
+    this.showOverlayFn();
+
     if (ss && ss.ok) {
       try {
         // Overlay grid and store the map
         const gridResult = overlayGrid(Buffer.from(ss.data, 'base64'));
+
+        // Fix Retina scaling: grid is built from image pixels (may be 2x physical),
+        // but macOS click APIs expect logical coordinates. Scale down the grid map.
+        const scaleFactor = ss.scaleFactor || 1;
+        if (scaleFactor > 1) {
+          console.log(`[screenshot] Retina detected (scale=${scaleFactor}). Scaling grid coords from physical to logical.`);
+          for (const [, cell] of Object.entries(gridResult.gridMap)) {
+            cell.x = Math.round(cell.x / scaleFactor);
+            cell.y = Math.round(cell.y / scaleFactor);
+            cell.cx = Math.round(cell.cx / scaleFactor);
+            cell.cy = Math.round(cell.cy / scaleFactor);
+            cell.w = Math.round(cell.w / scaleFactor);
+            cell.h = Math.round(cell.h / scaleFactor);
+          }
+        }
+
         this._lastGridMap = gridResult.gridMap;
+
+        // Log a sample cell for diagnostics
+        const sampleCell = gridResult.gridMap['F4'];
+        if (sampleCell) {
+          console.log(`[screenshot] Grid sample F4: center=(${sampleCell.cx}, ${sampleCell.cy}), size=${sampleCell.w}x${sampleCell.h}`);
+        }
 
         return [
           {
@@ -775,7 +1047,6 @@ class Agent {
         ];
       } catch (gridErr) {
         console.error('[agent] Grid overlay error, returning raw screenshot:', gridErr.message);
-        // Fallback to raw screenshot without grid
         this._lastGridMap = null;
         return [
           { type: 'image', source: { type: 'base64', media_type: ss.mediaType || 'image/png', data: ss.data } },
@@ -876,6 +1147,8 @@ class Agent {
         if (a === 'type') return `Typing into ${(tu.input.selector || '').slice(0, 30)}...`;
         if (a === 'scroll') return `Scrolling ${tu.input.direction || 'down'}...`;
         if (a === 'press_key') return `Pressing ${tu.input.key || '?'}...`;
+        if (a === 'list_tabs') return 'Listing open tabs...';
+        if (a === 'switch_tab') return `Switching to tab matching "${(tu.input.url || tu.input.text || '').slice(0, 30)}"...`;
         return `Browser: ${a}...`;
       }
       case 'native_action': {
@@ -901,6 +1174,19 @@ class Agent {
   clearHistory() {
     this.history = [];
     this.toolCallHistory = [];
+  }
+
+  /**
+   * Check if the current conversation looks like a "send message in chat" task.
+   * Used to remind the model to call key(enter) after type().
+   */
+  _looksLikeChatSend() {
+    const firstUserMsg = this.history.find((m) => m.role === 'user');
+    if (!firstUserMsg) return false;
+    const userText = (firstUserMsg.content?.find?.((c) => c.type === 'text')?.text || '').toLowerCase();
+    const chatApps = ['discord', 'slack', 'whatsapp', 'teams', 'chat', 'message'];
+    const sendWords = ['send', 'message', 'type', 'say', 'tell', 'write'];
+    return chatApps.some((app) => userText.includes(app)) && sendWords.some((w) => userText.includes(w));
   }
 
   _detectAppFromText(text) {

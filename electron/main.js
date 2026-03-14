@@ -146,13 +146,17 @@ async function captureScreen() {
   try {
     const primaryDisplay = screen.getPrimaryDisplay();
     const { width, height } = primaryDisplay.size;
+    const scaleFactor = primaryDisplay.scaleFactor || 1;
     const sources = await desktopCapturer.getSources({
       types: ['screen'],
       thumbnailSize: { width, height },
     });
     if (sources.length === 0) return { ok: false, error: 'No screen sources' };
-    const jpeg = sources[0].thumbnail.toJPEG(50);
-    return { ok: true, data: jpeg.toString('base64'), mediaType: 'image/jpeg' };
+    const thumb = sources[0].thumbnail;
+    const imgSize = thumb.getSize();
+    console.log(`[screenshot] display: ${width}x${height} logical, scaleFactor=${scaleFactor}, thumbnail: ${imgSize.width}x${imgSize.height}`);
+    const jpeg = thumb.toJPEG(50);
+    return { ok: true, data: jpeg.toString('base64'), mediaType: 'image/jpeg', scaleFactor, logicalWidth: width, logicalHeight: height };
   } catch (err) {
     return { ok: false, error: err.message };
   }
@@ -282,21 +286,13 @@ app.whenReady().then(async () => {
     computer = new Computer();
     console.log('[startup] Computer control ready');
 
-    // Try to connect to Chrome if it already has CDP enabled — don't auto-launch on startup.
-    // Chrome will be auto-launched later on demand when the agent needs it.
+    // Try to connect to Chrome CDP — auto-launch debug instance if needed.
     let cdpResult = { connected: false, message: 'Skipped' };
     try {
-      const alive = await browser.isCDPAlive(9222);
-      if (alive) {
-        const ok = await browser.connectToChrome();
-        cdpResult = ok
-          ? { connected: true, message: 'Connected to existing Chrome CDP' }
-          : { connected: false, message: 'CDP alive but connect failed' };
-      } else {
-        cdpResult = { connected: false, message: 'No Chrome CDP on port 9222 — will auto-launch when needed' };
-      }
+      cdpResult = await browser.autoConnectOrLaunchChrome();
     } catch (err) {
-      console.log('[startup] CDP check error:', err.message);
+      console.log('[startup] CDP auto-connect error:', err.message);
+      cdpResult = { connected: false, message: err.message };
     }
     console.log(`[startup] Chrome CDP: ${cdpResult.message}`);
 
@@ -308,6 +304,17 @@ app.whenReady().then(async () => {
       blurOverlayFn: () => {
         if (mb.window && !mb.window.isDestroyed()) {
           mb.window.blur();
+        }
+      },
+      hideOverlayFn: () => {
+        if (mb.window && !mb.window.isDestroyed()) {
+          mb.hideWindow();
+        }
+      },
+      showOverlayFn: () => {
+        if (mb && mb.window && !mb.window.isDestroyed()) {
+          mb.showWindow();
+          mb.window.showInactive();
         }
       },
       onProgress: (info) => sendToRenderer('agent-progress', info),

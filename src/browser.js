@@ -7,8 +7,6 @@
 
 const { chromium } = require('playwright');
 const { exec, execSync } = require('child_process');
-const path = require('path');
-const os = require('os');
 
 const IS_WIN = process.platform === 'win32';
 const IS_MAC = process.platform === 'darwin';
@@ -72,21 +70,7 @@ const APP_DEBUG_PORTS = {
   obsidian: 9230, teams: 9231,
 };
 
-// Platform-specific launch commands for Electron apps
-const APP_LAUNCH_COMMANDS = IS_MAC ? {
-  // macOS — Electron app CDP launch is not yet implemented.
-  // Chrome is handled separately in autoConnectOrLaunchChrome().
-  vscode: 'code --remote-debugging-port=9223',
-} : {
-  // Windows
-  discord: '%LOCALAPPDATA%\\Discord\\Update.exe --processStart Discord.exe --process-start-args="--remote-debugging-port=9224"',
-  spotify: '%APPDATA%\\Spotify\\Spotify.exe --remote-debugging-port=9227',
-  slack: '%LOCALAPPDATA%\\slack\\slack.exe --remote-debugging-port=9225',
-  chrome: 'start chrome --remote-debugging-port=9222',
-  vscode: 'code --remote-debugging-port=9223',
-  obsidian: '%LOCALAPPDATA%\\Obsidian\\Obsidian.exe --remote-debugging-port=9230',
-  teams: '%LOCALAPPDATA%\\Microsoft\\Teams\\current\\Teams.exe --remote-debugging-port=9231',
-};
+// APP_LAUNCH_COMMANDS removed — the assistant never launches or kills user apps.
 
 // Title fragments → app name mapping (cross-platform)
 const TITLE_TO_APP = [
@@ -122,12 +106,24 @@ async function _isCDPAlive(port = 9222) {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 1500);
-    const res = await fetch(`http://localhost:${port}/json/version`, { signal: controller.signal });
+    const res = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: controller.signal });
     clearTimeout(timeout);
+    if (!res.ok) {
+      console.log(`[browser] CDP check port ${port}: HTTP ${res.status}`);
+    }
     return res.ok;
-  } catch {
+  } catch (err) {
+    const reason = err.name === 'AbortError' ? 'timeout (1.5s)' : (err.cause?.code || err.message || 'unknown');
+    console.log(`[browser] CDP check port ${port} failed: ${reason}`);
     return false;
   }
+}
+
+// Track why CDP isn't connected — exposed to agent for context
+let _lastCDPFailReason = '';
+
+function getLastCDPFailReason() {
+  return _lastCDPFailReason;
 }
 
 async function connectToChrome() {
@@ -135,19 +131,38 @@ async function connectToChrome() {
     // Quick HTTP check first — avoids slow Playwright timeout if CDP isn't there
     const alive = await _isCDPAlive(9222);
     if (!alive) {
+      const isRunning = await _isChromeRunning();
+      _lastCDPFailReason = isRunning
+        ? 'Chrome is running but port 9222 is not responding (not launched with --remote-debugging-port=9222)'
+        : 'Chrome is not running';
+      console.log(`[browser] CDP not alive: ${_lastCDPFailReason}`);
       browser = null;
       page = null;
       return false;
     }
 
-    browser = await chromium.connectOverCDP('http://localhost:9222');
-    await getCurrentPage();
+    browser = await chromium.connectOverCDP('http://127.0.0.1:9222');
+
+    // Tabs may take a moment to appear — retry a few times
+    let p = null;
+    for (let i = 0; i < 3; i++) {
+      p = await getCurrentPage();
+      if (p) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    if (!p) {
+      _lastCDPFailReason = 'CDP connected but no usable tabs found after retries';
+      console.log(`[browser] ${_lastCDPFailReason}`);
+      return false;
+    }
+    _lastCDPFailReason = '';
     console.log('[browser] Connected to Chrome via CDP');
     return true;
   } catch (err) {
     browser = null;
     page = null;
-    console.log('[browser] CDP connect failed:', err.message);
+    _lastCDPFailReason = `CDP connect error: ${err.message}`;
+    console.log(`[browser] ${_lastCDPFailReason}`);
     return false;
   }
 }
@@ -178,120 +193,39 @@ function _isChromeRunning() {
   });
 }
 
-/**
- * Get the Chrome user data directory for the current platform.
- * Returns path string or null.
- */
-function _getChromeUserDataDir() {
-  if (IS_WIN) {
-    return process.env.LOCALAPPDATA
-      ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'User Data')
-      : null;
-  }
-  if (IS_MAC) {
-    return path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome');
-  }
-  // Linux
-  return path.join(os.homedir(), '.config', 'google-chrome');
-}
+// _getChromeUserDataDir removed — no longer launching Chrome.
+
+// _launchChrome and _getDebugProfileDir removed — the assistant must never
+// launch, kill, or replace the user's Chrome. Connect-only.
 
 /**
- * Get a temp directory path for a debug Chrome profile.
- */
-function _getDebugProfileDir() {
-  if (IS_WIN) {
-    const base = process.env.TEMP || path.join(process.env.LOCALAPPDATA || '', 'Temp');
-    return path.join(base, 'chrome-cdp-debug');
-  }
-  return path.join(os.tmpdir(), 'chrome-cdp-debug');
-}
-
-/**
- * Launch Chrome with remote debugging port.
- * @param {string|null} userDataDir - optional user data dir
- * @param {object} opts - { noFirstRun: bool }
- */
-function _launchChrome(userDataDir, opts = {}) {
-  if (IS_WIN) {
-    const udArg = userDataDir ? ` --user-data-dir="${userDataDir}"` : '';
-    const nfr = opts.noFirstRun ? ' --no-first-run' : '';
-    exec(`start "" "chrome" --remote-debugging-port=9222${udArg}${nfr}`, { shell: true, windowsHide: true });
-  } else if (IS_MAC) {
-    // On macOS, use 'open' to launch Chrome with args
-    const args = ['--remote-debugging-port=9222'];
-    if (userDataDir) args.push(`--user-data-dir=${userDataDir}`);
-    if (opts.noFirstRun) args.push('--no-first-run');
-    const argsStr = args.join(' ');
-    exec(`open -na "Google Chrome" --args ${argsStr}`);
-  } else {
-    // Linux fallback
-    const udArg = userDataDir ? ` --user-data-dir="${userDataDir}"` : '';
-    const nfr = opts.noFirstRun ? ' --no-first-run' : '';
-    exec(`google-chrome --remote-debugging-port=9222${udArg}${nfr} &`, { shell: true });
-  }
-}
-
-/**
- * Auto-connect to Chrome or launch it with CDP debug port.
- * Flow:
- * 1. Try existing CDP connection on port 9222
- * 2. If fails, detect if Chrome is running without debug port
- * 3. If Chrome isn't running, launch with --remote-debugging-port=9222
- * 4. If Chrome IS running (no CDP), launch a new instance with debug port + temp profile
- * Returns { connected: bool, message: string }
+ * Try to connect to the user's existing Chrome on port 9222.
+ * NEVER launches Chrome, NEVER kills Chrome, NEVER opens a second instance.
+ * If Chrome isn't running or doesn't have --remote-debugging-port=9222, returns
+ * a clear message telling the user how to restart Chrome with the flag.
  */
 async function autoConnectOrLaunchChrome() {
-  // First try existing CDP
+  // Try existing CDP on port 9222
   const connected = await connectToChrome();
   if (connected) {
     return { connected: true, message: 'Connected to existing Chrome CDP' };
   }
 
-  const userDataDir = _getChromeUserDataDir();
-
-  // Check if any Chrome is running
+  // Connection failed — figure out why and give user a clear message
   const isRunning = await _isChromeRunning();
 
+  const restartCmd = IS_MAC
+    ? 'open -na "Google Chrome" --args --remote-debugging-port=9222'
+    : 'chrome --remote-debugging-port=9222';
+
   if (!isRunning) {
-    // Chrome not running — launch with debug port and user's existing profile
-    console.log('[browser] Chrome not running — launching with CDP debug port...');
-    _launchChrome(userDataDir);
-
-    // Wait for Chrome to start — use HTTP check for faster detection
-    for (let attempt = 0; attempt < 8; attempt++) {
-      await new Promise((r) => setTimeout(r, 800));
-      const alive = await _isCDPAlive(9222);
-      if (alive) {
-        const ok = await connectToChrome();
-        if (ok) return { connected: true, message: 'Launched Chrome with CDP debug port' };
-      }
-    }
-    return { connected: false, message: 'Launched Chrome but could not connect to CDP' };
+    _lastCDPFailReason = `Chrome is not running. Start it with: ${restartCmd}`;
+  } else {
+    _lastCDPFailReason = `Chrome is running but without --remote-debugging-port=9222. To fix: quit Chrome (${IS_MAC ? 'Cmd+Q' : 'close all windows'}), then run: ${restartCmd} — your tabs will reopen and the assistant will connect to that same Chrome.`;
   }
 
-  // Chrome IS running but without debug port
-  // Launch a secondary instance with a separate debugging profile
-  console.log('[browser] Chrome running without CDP. Launching debug instance...');
-  const debugProfile = _getDebugProfileDir();
-  _launchChrome(debugProfile, { noFirstRun: true });
-
-  for (let attempt = 0; attempt < 8; attempt++) {
-    await new Promise((r) => setTimeout(r, 800));
-    const alive = await _isCDPAlive(9222);
-    if (alive) {
-      const ok = await connectToChrome();
-      if (ok) return { connected: true, message: 'Connected to Chrome debug instance' };
-    }
-  }
-
-  const hint = IS_MAC
-    ? 'Close all Chrome windows and try again, or launch Chrome from terminal: open -na "Google Chrome" --args --remote-debugging-port=9222'
-    : 'Close all Chrome windows and try again, or restart Chrome with: chrome --remote-debugging-port=9222';
-
-  return {
-    connected: false,
-    message: `Chrome is running but without --remote-debugging-port=9222. ${hint}`,
-  };
+  console.log(`[browser] ${_lastCDPFailReason}`);
+  return { connected: false, message: _lastCDPFailReason };
 }
 
 function isConnected() {
@@ -305,10 +239,28 @@ async function getCurrentPage() {
       return null;
     }
     const contexts = browser.contexts();
-    if (!contexts.length) { page = null; return null; }
-    const pages = contexts[0].pages();
-    if (!pages.length) { page = null; return null; }
-    page = pages[pages.length - 1];
+    if (!contexts.length) {
+      console.log('[browser] getCurrentPage: 0 contexts');
+      page = null;
+      return null;
+    }
+
+    // Search ALL contexts for pages (on macOS, default context may be empty)
+    let allPages = [];
+    for (const ctx of contexts) {
+      const ctxPages = ctx.pages();
+      allPages.push(...ctxPages);
+    }
+    console.log(`[browser] getCurrentPage: ${contexts.length} contexts, ${allPages.length} total pages`);
+    if (!allPages.length) { page = null; return null; }
+
+    // If we already have a valid page reference, keep it
+    if (page && allPages.includes(page)) {
+      return page;
+    }
+
+    // Pick the last page (most recently opened tab)
+    page = allPages[allPages.length - 1];
     return page;
   } catch (err) {
     console.error('[browser] getCurrentPage error:', err.message);
@@ -356,6 +308,7 @@ async function getPageContext() {
     if (!page) return null;
     const url = page.url();
     const title = await page.title();
+    console.log(`[browser] getPageContext → tab: ${url.slice(0, 80)} — "${title.slice(0, 50)}"`);
     const elements = await _extractElements(page);
     return { url, title, elements };
   } catch (err) {
@@ -424,42 +377,12 @@ async function connectToApp(appName) {
 }
 
 /**
- * Kill an existing app instance and relaunch with --remote-debugging-port.
- * Waits 3 seconds, then tries to connect.
- * Returns connection or null.
+ * launchAndConnect is disabled — the assistant must never kill or relaunch user apps.
+ * Use connectToApp() to connect to an app that already has a CDP debug port.
  */
-async function launchAndConnect(appName) {
-  const key = appName.toLowerCase();
-  const cmd = APP_LAUNCH_COMMANDS[key];
-  if (!cmd) {
-    if (IS_MAC) {
-      console.warn(`[browser] Electron app CDP launch for "${key}" is not yet supported on macOS.`);
-    }
-    return null;
-  }
-
-  // Kill existing instance — platform-specific
-  try {
-    const { execSync } = require('child_process');
-    if (IS_WIN) {
-      execSync(`taskkill /IM ${key}.exe /F 2>nul`, { windowsHide: true });
-    } else if (IS_MAC) {
-      execSync(`pkill -f "${key}" 2>/dev/null || true`, { stdio: 'pipe' });
-    } else {
-      execSync(`pkill -f "${key}" 2>/dev/null || true`, { stdio: 'pipe' });
-    }
-  } catch { /* not running — fine */ }
-
-  // Launch with debug port
-  return new Promise((resolve) => {
-    exec(cmd, { shell: true });
-
-    // Wait for app to start, then connect
-    setTimeout(async () => {
-      const conn = await connectToApp(key);
-      resolve(conn);
-    }, 3000);
-  });
+async function launchAndConnect(_appName) {
+  console.log(`[browser] launchAndConnect disabled — will not kill or relaunch apps. Use connectToApp() instead.`);
+  return null;
 }
 
 /**
@@ -537,6 +460,76 @@ async function getAppPageContext(appName) {
 // ---------------------------------------------------------------------------
 // Browser actions (cross-platform — these use Playwright which is already cross-platform)
 // ---------------------------------------------------------------------------
+
+/**
+ * List all open tabs (pages) in the Chrome browser context.
+ * Returns [{ url, title, index }] or empty array.
+ */
+async function listTabs() {
+  try {
+    if (!browser || !browser.isConnected()) return [];
+    const contexts = browser.contexts();
+    if (!contexts.length) return [];
+    // Search all contexts for pages
+    const allPages = [];
+    for (const ctx of contexts) {
+      allPages.push(...ctx.pages());
+    }
+    const tabs = [];
+    for (let i = 0; i < allPages.length; i++) {
+      try {
+        const url = allPages[i].url();
+        const title = await allPages[i].title();
+        tabs.push({ url, title, index: i });
+      } catch {
+        tabs.push({ url: '(error)', title: '(error)', index: i });
+      }
+    }
+    return tabs;
+  } catch (err) {
+    console.error('[browser] listTabs error:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Switch to a tab whose URL or title matches the given pattern (case-insensitive).
+ * Sets the module-level `page` to the matched tab so all subsequent actions use it.
+ * Returns { ok, url, title } or { ok: false, error }.
+ */
+async function switchToTab(pattern) {
+  try {
+    if (!browser || !browser.isConnected()) {
+      return { ok: false, error: 'No browser connection' };
+    }
+    const contexts = browser.contexts();
+    if (!contexts.length) return { ok: false, error: 'No browser context' };
+    // Search all contexts
+    const allPages = [];
+    for (const ctx of contexts) {
+      allPages.push(...ctx.pages());
+    }
+
+    const regex = new RegExp(pattern, 'i');
+    for (const p of allPages) {
+      try {
+        const url = p.url();
+        const title = await p.title();
+        if (regex.test(url) || regex.test(title)) {
+          page = p;
+          // Bring the tab to front via CDP
+          try { await p.bringToFront(); } catch { /* best effort */ }
+          console.log(`[browser] Switched to tab: ${url} — "${title}"`);
+          return { ok: true, url, title };
+        }
+      } catch { /* skip broken page */ }
+    }
+    return { ok: false, error: `No tab matching "${pattern}". Use list_tabs to see open tabs.` };
+  } catch (err) {
+    console.error('[browser] switchToTab error:', err.message);
+    return { ok: false, error: err.message };
+  }
+}
 
 async function cdpClick(selector) {
   try {
@@ -630,6 +623,7 @@ async function cdpWaitForLoad(ms = 2000) {
 module.exports = {
   // Chrome
   connectToChrome,
+  getLastCDPFailReason,
   autoConnectOrLaunchChrome,
   isConnected,
   isCDPAlive: _isCDPAlive,
@@ -640,6 +634,9 @@ module.exports = {
   launchAndConnect,
   detectCurrentApp,
   getAppPageContext,
+  // Tab management
+  listTabs,
+  switchToTab,
   // Browser actions
   cdpClick,
   cdpClickText,
