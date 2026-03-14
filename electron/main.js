@@ -169,7 +169,7 @@ ipcMain.handle('transcribe-audio', async (_event, { audioBase64 }) => {
 
 app.whenReady().then(async () => {
   mb = menubar({
-    index: `file://${path.join(__dirname, 'panel.html')}`,
+    index: `file:///${path.join(__dirname, 'panel.html').replace(/\\/g, '/')}`,
     icon: createTrayIcon('#666666'),
     tooltip: 'AI Assistant',
     preloadWindow: true,

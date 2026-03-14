@@ -111,11 +111,14 @@ Tier 2 — GRID CELLS (good): take_screenshot returns an image with a labeled gr
 Tier 3 — RAW COORDINATES (last resort): Only use x/y if tiers 1 and 2 fail.
   - NEVER guess coordinates from a screenshot image. ALWAYS derive them from read_screen elements or grid cells.
 
-CLICK VERIFICATION:
-- After every click, the result tells you the active window title. Check it changed as expected.
+ACTION VERIFICATION — CRITICAL (do not hallucinate):
+- After type/key/click, the result tells you the active window title. CHECK IT.
+- If the result says "WARNING: Window focus may have changed" — the text likely went to the WRONG window. Take a screenshot to verify.
+- NEVER claim you typed or clicked successfully without evidence. The tool result only confirms the ACTION was sent, NOT that it landed correctly.
+- After typing into an app, take_screenshot to VERIFY the text actually appeared. Do NOT assume success.
 - If clicking didn't change anything (same window title, no expected result), DON'T retry the same click.
 - Instead: try a DIFFERENT approach — keyboard shortcut, different element, or ask the user.
-- If you've clicked 2+ times with no progress, take_screenshot to see what actually happened.
+- If you've tried 2+ times with no progress, take_screenshot to see what actually happened.
 
 BROWSER (browser_action):
 - Use for ANYTHING in a browser. It's instant via CDP — no screenshots needed.
@@ -406,7 +409,10 @@ class Agent {
 
         // Inter-action delay: apps need time to process previous actions
         if (i > 0 && (tu.name === 'native_action' || toolUses[i - 1].name === 'native_action')) {
-          await new Promise((r) => setTimeout(r, 150));
+          // Extra delay after focus_window — Windows needs time to fully activate the target
+          const prevAction = toolUses[i - 1]?.input?.action;
+          const delay = prevAction === 'focus_window' ? 350 : 200;
+          await new Promise((r) => setTimeout(r, delay));
         }
 
         this.onProgress({ type: 'status', text: this._toolLabel(tu) });
@@ -682,15 +688,20 @@ class Agent {
       case 'type': {
         const val = input.value || input.target || '';
         if (!val) return [{ type: 'text', text: 'type requires a value.' }];
+        const preTypeTitle = this.computer.getForegroundWindowTitle();
         await this.computer.type(val);
-        return [{ type: 'text', text: `Typed "${val.slice(0, 50)}${val.length > 50 ? '...' : ''}"` }];
+        const postTypeTitle = this.computer.getForegroundWindowTitle();
+        const focusOk = preTypeTitle === postTypeTitle && postTypeTitle !== '';
+        return [{ type: 'text', text: `Typed "${val.slice(0, 50)}${val.length > 50 ? '...' : ''}" — active window: "${postTypeTitle}"${focusOk ? '' : ' WARNING: Window focus may have changed during typing. Text might have gone to wrong window. Take a screenshot to verify.'}` }];
       }
 
       case 'key': {
         const keys = input.value || input.target || '';
         if (!keys) return [{ type: 'text', text: 'key requires a value (e.g. "ctrl+c", "enter").' }];
+        const preKeyTitle = this.computer.getForegroundWindowTitle();
         await this.computer.key(keys);
-        return [{ type: 'text', text: `Pressed ${keys}` }];
+        const postKeyTitle = this.computer.getForegroundWindowTitle();
+        return [{ type: 'text', text: `Pressed ${keys} — active window: "${postKeyTitle}"${postKeyTitle !== preKeyTitle ? ' (window changed)' : ''}` }];
       }
 
       case 'scroll': {

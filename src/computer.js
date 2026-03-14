@@ -109,6 +109,20 @@ const VK = {
 };
 
 // ---------------------------------------------------------------------------
+// Synchronous sleep — blocks the thread to let Windows process focus changes.
+// Uses Atomics.wait (true sleep, no CPU burn) with busy-wait fallback.
+// ---------------------------------------------------------------------------
+
+function _syncSleepMs(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {} // busy-wait fallback
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Computer class
 // ---------------------------------------------------------------------------
 
@@ -122,15 +136,37 @@ class Computer {
 
   /**
    * Re-verify and re-set focus to the last focusWindow target.
-   * Called synchronously right before keystrokes to prevent the Electron
-   * overlay from stealing focus during async gaps.
+   * Called synchronously right before keystrokes. Retries up to 3 times
+   * with sync sleep to verify focus actually transferred at the OS level.
+   * SetForegroundWindow is async on Windows — it requests focus but doesn't
+   * guarantee it's granted by the time it returns.
    */
   _ensureTargetFocused() {
     if (!this._lastFocusedHwnd) return;
-    // Alt trick: briefly press/release Alt to unlock SetForegroundWindow
-    keybd_event(0x12, 0, 0, 0);
-    keybd_event(0x12, 0, KEYEVENTF_KEYUP, 0);
-    SetForegroundWindow(this._lastFocusedHwnd);
+
+    // Get the target window title for focus verification
+    const targetTitleBuf = Buffer.alloc(256);
+    const targetTitleLen = GetWindowTextA(this._lastFocusedHwnd, targetTitleBuf, 256);
+    const targetTitle = targetTitleBuf.toString('utf8', 0, targetTitleLen);
+
+    // Check if already focused — no action needed
+    if (this.getForegroundWindowTitle() === targetTitle) return;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      // Use Ctrl (not Alt!) to generate an input event that unlocks SetForegroundWindow.
+      // Alt triggers Access Key overlays in modern Windows apps (Notepad, Edge, etc.)
+      // which puts the app into menu mode and eats subsequent keystrokes.
+      keybd_event(0x11, 0, 0, 0);              // Ctrl down (benign — no visible effect)
+      keybd_event(0x11, 0, KEYEVENTF_KEYUP, 0); // Ctrl up
+      SetForegroundWindow(this._lastFocusedHwnd);
+
+      // Sync sleep — let Windows process the focus change
+      _syncSleepMs(60 + attempt * 40); // 60ms, 100ms, 140ms
+
+      // Verify: is the foreground window now our target?
+      if (this.getForegroundWindowTitle() === targetTitle) return; // Focus confirmed
+    }
+    console.warn('[computer] _ensureTargetFocused: focus verification failed after 3 attempts');
   }
 
   _validateCoords(...vals) {
@@ -385,9 +421,10 @@ class Computer {
       const targetThread = GetWindowThreadProcessId(match.hwnd, targetPidBuf);
       const curThread = GetCurrentThreadId();
 
-      // Alt trick first — unlocks SetForegroundWindow on modern Windows
-      keybd_event(0x12, 0, 0, 0);
-      keybd_event(0x12, 0, KEYEVENTF_KEYUP, 0);
+      // Ctrl press/release to generate input event — unlocks SetForegroundWindow.
+      // Do NOT use Alt — it triggers Access Key overlays in modern Windows apps.
+      keybd_event(0x11, 0, 0, 0);
+      keybd_event(0x11, 0, KEYEVENTF_KEYUP, 0);
 
       AttachThreadInput(curThread, fgThread, true);
       AttachThreadInput(curThread, targetThread, true);
@@ -514,7 +551,9 @@ class Computer {
         encoding: 'utf8',
       });
 
-      const result = JSON.parse(output);
+      // Strip control characters that break JSON (especially 0x1A = DOS EOF marker)
+      const cleaned = output.replace(/[\x00-\x1f]/g, (ch) => ch === '\n' || ch === '\r' ? ch : ' ');
+      const result = JSON.parse(cleaned);
       if (result && Array.isArray(result.elements) && result.elements.length > 0) {
         return result;
       }

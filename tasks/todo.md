@@ -48,6 +48,13 @@
 - [x] Text input field added to panel
 - [x] Delete old overlay.html
 
+## Phase 3.6 — Click Accuracy & Automation Reliability (Approach D: Hybrid) ✓
+- [x] Grid overlay (grid-overlay.js) — 12×8 labeled grid (A1-L8), 2x scale labels, 3px grid lines
+- [x] UIAutomation via C# helper (uia-helper.cs) — compiled on first run, returns 80+ elements with bounding rects
+- [x] computer.js — UIA helper integration, recursive EnumChildWindows fallback, JSON sanitization
+- [x] browser.js — HTTP /json/version check before CDP connect, faster retry (800ms × 8)
+- [x] agent.js — 3-tier click system (element name > grid cell > raw coords), click verification (active window feedback), improved system prompt
+
 ## Phase 7 — Polish
 - [ ] tasks/lessons.md gets written after each correction
 - [ ] Error states in UI (no mic permission, API key missing, extension not installed)
