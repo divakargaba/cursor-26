@@ -398,7 +398,7 @@
   <div id="input-bar">
     <button id="btn-mic" title="Click to speak">&#x1F3A4;</button>
     <input type="text" id="text-input" placeholder="Type a message..." autocomplete="off">
-    <span id="hotkey-hint">Ctrl+Shift+Space</span>
+    <span id="hotkey-hint"></span>
   </div>
 </div>
 
@@ -412,6 +412,12 @@
   const orbEl = document.getElementById('orb');
   const orbStatusEl = document.getElementById('orb-status');
   const orbSectionEl = document.getElementById('orb-section');
+
+  // Platform-aware hotkey hint
+  const hotkeyHintEl = document.getElementById('hotkey-hint');
+  if (hotkeyHintEl) {
+    hotkeyHintEl.textContent = navigator.platform.includes('Mac') ? '⌃⇧Space' : 'Ctrl+Shift+Space';
+  }
   const textInput = document.getElementById('text-input');
 
   let currentActionId = null;

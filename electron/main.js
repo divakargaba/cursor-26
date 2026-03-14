@@ -32,14 +32,99 @@ if (!gotLock) {
 }
 
 function createTrayIcon(color) {
+  // Create a small PNG tray icon programmatically.
+  // macOS requires actual image data (not SVG) and prefers 16x16 or 22x22 template images.
+  // We build a minimal 16x16 RGBA buffer and draw a filled circle.
   const size = 16;
-  const canvas = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">
-    <circle cx="8" cy="8" r="6" fill="${color}"/>
-  </svg>`;
+  const r = 6;
+  const cx = 8, cy = 8;
+
+  // Parse hex color
+  const hex = color.replace('#', '');
+  const cr = parseInt(hex.substring(0, 2), 16);
+  const cg = parseInt(hex.substring(2, 4), 16);
+  const cb = parseInt(hex.substring(4, 6), 16);
+
+  // Create RGBA pixel buffer
+  const pixels = Buffer.alloc(size * size * 4, 0);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const dx = x - cx, dy = y - cy;
+      if (dx * dx + dy * dy <= r * r) {
+        const offset = (y * size + x) * 4;
+        pixels[offset] = cr;
+        pixels[offset + 1] = cg;
+        pixels[offset + 2] = cb;
+        pixels[offset + 3] = 255;
+      }
+    }
+  }
+
   return nativeImage.createFromBuffer(
-    Buffer.from(canvas),
+    createPNGBuffer(size, size, pixels),
     { width: size, height: size }
   );
+}
+
+/**
+ * Create a minimal PNG from raw RGBA pixel data.
+ * Avoids needing canvas or sharp — just raw zlib + PNG structure.
+ */
+function createPNGBuffer(width, height, rgbaPixels) {
+  const zlib = require('zlib');
+
+  // PNG filter: prepend 0 (None filter) to each row
+  const filtered = Buffer.alloc(height * (width * 4 + 1));
+  for (let y = 0; y < height; y++) {
+    filtered[y * (width * 4 + 1)] = 0; // filter byte
+    rgbaPixels.copy(filtered, y * (width * 4 + 1) + 1, y * width * 4, (y + 1) * width * 4);
+  }
+
+  const deflated = zlib.deflateSync(filtered);
+
+  // Build PNG
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+
+  function chunk(type, data) {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length);
+    const typeB = Buffer.from(type);
+    const crcData = Buffer.concat([typeB, data]);
+    const crc = Buffer.alloc(4);
+    crc.writeInt32BE(crc32(crcData));
+    return Buffer.concat([len, typeB, data, crc]);
+  }
+
+  // IHDR
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;  // bit depth
+  ihdr[9] = 6;  // color type: RGBA
+  ihdr[10] = 0; // compression
+  ihdr[11] = 0; // filter
+  ihdr[12] = 0; // interlace
+
+  const iend = Buffer.alloc(0);
+
+  return Buffer.concat([
+    signature,
+    chunk('IHDR', ihdr),
+    chunk('IDAT', deflated),
+    chunk('IEND', iend),
+  ]);
+}
+
+/** CRC32 for PNG chunks */
+function crc32(buf) {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) {
+    crc ^= buf[i];
+    for (let j = 0; j < 8; j++) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xEDB88320 : 0);
+    }
+  }
+  return (crc ^ 0xFFFFFFFF) | 0;
 }
 
 function setTrayState(state) {
@@ -197,12 +282,21 @@ app.whenReady().then(async () => {
     computer = new Computer();
     console.log('[startup] Computer control ready');
 
-    // Try CDP connect to Chrome — auto-launch if not running with debug port
+    // Try to connect to Chrome if it already has CDP enabled — don't auto-launch on startup.
+    // Chrome will be auto-launched later on demand when the agent needs it.
     let cdpResult = { connected: false, message: 'Skipped' };
     try {
-      cdpResult = await browser.autoConnectOrLaunchChrome();
+      const alive = await browser.isCDPAlive(9222);
+      if (alive) {
+        const ok = await browser.connectToChrome();
+        cdpResult = ok
+          ? { connected: true, message: 'Connected to existing Chrome CDP' }
+          : { connected: false, message: 'CDP alive but connect failed' };
+      } else {
+        cdpResult = { connected: false, message: 'No Chrome CDP on port 9222 — will auto-launch when needed' };
+      }
     } catch (err) {
-      console.log('[startup] CDP auto-connect error:', err.message);
+      console.log('[startup] CDP check error:', err.message);
     }
     console.log(`[startup] Chrome CDP: ${cdpResult.message}`);
 

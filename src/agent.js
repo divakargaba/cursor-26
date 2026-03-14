@@ -615,9 +615,13 @@ class Agent {
       case 'read_screen': {
         const uiInfo = await this.computer.getUIElements();
         if (!uiInfo || !uiInfo.elements || uiInfo.elements.length === 0) {
-          return [{ type: 'text', text: `Window: ${uiInfo ? uiInfo.window : 'unknown'}\nNo interactive elements found (source: ${uiInfo?.source || 'unknown'}).\nThis app may use custom rendering. Try take_screenshot for grid-based targeting, or use keyboard shortcuts.` }];
+          const macHint = uiInfo?.source === 'macos-stub'
+            ? '\nOn macOS, UI element enumeration is not yet available. Use take_screenshot with grid cells, or keyboard shortcuts.'
+            : '\nThis app may use custom rendering. Try take_screenshot for grid-based targeting, or use keyboard shortcuts.';
+          return [{ type: 'text', text: `Window: ${uiInfo ? uiInfo.window : 'unknown'}\nNo interactive elements found (source: ${uiInfo?.source || 'unknown'}).${macHint}` }];
         }
-        const source = uiInfo.source === 'uia' ? 'UIAutomation' : 'Win32 EnumChildWindows';
+        const SOURCE_LABELS = { uia: 'UIAutomation', win32: 'Win32 EnumChildWindows', 'macos-stub': 'macOS (limited)' };
+        const source = SOURCE_LABELS[uiInfo.source] || uiInfo.source;
         const rows = uiInfo.elements.map((e) =>
           `  [${e.type}] "${e.name}" at (${e.x}, ${e.y}) ${e.w}x${e.h}${e.enabled === false ? ' [DISABLED]' : ''}`
         );

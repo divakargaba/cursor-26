@@ -48,6 +48,44 @@
 - [x] Text input field added to panel
 - [x] Delete old overlay.html
 
+## Phase 3.6 — macOS Platform Support ✓
+Platform abstraction introduced so the app runs on both Windows and macOS.
+
+### Architecture
+- `src/computer.js` — Platform dispatcher: detects `process.platform`, requires the right module
+- `src/computer.windows.js` — Original Windows implementation (koffi/Win32 DLLs), unchanged
+- `src/computer.macos.js` — New macOS implementation (AppleScript + cliclick)
+- `src/browser.js` — Now platform-aware for Chrome detection, launch, and window title reading
+
+### macOS — What works
+- [x] Mouse: leftClick, rightClick, doubleClick, mouseMove, leftClickDrag (via cliclick)
+- [x] Scroll: coarse scroll via AppleScript Page Up/Down key codes
+- [x] Keyboard: type(text) via clipboard+Cmd+V paste, key(combo) via AppleScript keystroke/key code
+- [x] Clipboard: pbcopy/pbpaste (preserves and restores)
+- [x] Window management: focusWindow(pattern) and listWindows() via AppleScript System Events
+- [x] getForegroundWindowTitle() via AppleScript
+- [x] Chrome CDP: autoConnectOrLaunchChrome() uses `open -na "Google Chrome" --args`, `pgrep` for detection
+- [x] Hotkey hint in panel.html shows ⌃⇧Space on Mac, Ctrl+Shift+Space on Windows
+- [x] Agent read_screen gives clear macOS-specific guidance when UI elements are unavailable
+
+### macOS — What's stubbed / limited
+- [ ] getUIElements() returns empty array with source: 'macos-stub' — no AX API yet
+- [ ] Electron app CDP launch (Discord, Spotify, etc.) — only VS Code supported on macOS
+- [ ] Right-click and middle-click without cliclick are limited/unsupported
+- [ ] Scroll is coarse (Page Up/Down), not smooth pixel scrolling
+- [ ] mouseMove without cliclick is a no-op
+
+### External dependencies (macOS)
+- **cliclick** (recommended): `brew install cliclick` — provides precise mouse control
+  - Without it: left-click works via AppleScript, but right-click/drag/move are unsupported
+  - Referenced in: `src/computer.macos.js` (detected at load time)
+
+### Follow-up items
+- [ ] Implement macOS Accessibility API (AXUIElement) bindings for getUIElements()
+- [ ] Add more Electron app launch commands for macOS (Discord, Slack, Spotify .app paths)
+- [ ] Use Quartz CGEvent for smooth scrolling instead of Page Up/Down key codes
+- [ ] Investigate node-mac-permissions for accessibility permission prompts
+
 ## Phase 7 — Polish
 - [ ] tasks/lessons.md gets written after each correction
 - [ ] Error states in UI (no mic permission, API key missing, extension not installed)

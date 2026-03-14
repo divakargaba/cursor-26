@@ -1,22 +1,65 @@
-// browser.js — CDP browser control via Playwright
+// browser.js — CDP browser control via Playwright (cross-platform)
 // Connects to Chrome AND Electron apps (Discord, Spotify, Slack, etc.)
 // via --remote-debugging-port for full DOM access.
+//
+// Platform-aware: detects Windows vs macOS for Chrome launch/detection,
+// window title detection, and Electron app paths.
 
 const { chromium } = require('playwright');
-const { exec } = require('child_process');
+const { exec, execSync } = require('child_process');
+const path = require('path');
+const os = require('os');
+
+const IS_WIN = process.platform === 'win32';
+const IS_MAC = process.platform === 'darwin';
 
 // ---------------------------------------------------------------------------
-// Minimal koffi bindings for window detection (only GetForegroundWindow + GetWindowText)
+// Window title detection — platform-specific
+// On Windows: koffi + user32.dll (fast, synchronous)
+// On macOS: AppleScript (slightly slower, but reliable)
 // ---------------------------------------------------------------------------
 
 let _GetForegroundWindow, _GetWindowTextA;
-try {
-  const koffi = require('koffi');
-  const u32 = koffi.load('user32.dll');
-  _GetForegroundWindow = u32.func('void * __stdcall GetForegroundWindow()');
-  _GetWindowTextA = u32.func('int __stdcall GetWindowTextA(void *hWnd, uint8_t *buf, int maxCount)');
-} catch {
-  // koffi not available — detectCurrentApp will be limited
+if (IS_WIN) {
+  try {
+    const koffi = require('koffi');
+    const u32 = koffi.load('user32.dll');
+    _GetForegroundWindow = u32.func('void * __stdcall GetForegroundWindow()');
+    _GetWindowTextA = u32.func('int __stdcall GetWindowTextA(void *hWnd, uint8_t *buf, int maxCount)');
+  } catch {
+    // koffi not available — detectCurrentApp will be limited
+  }
+}
+
+/**
+ * Get the title of the currently focused window (cross-platform).
+ * Returns string or '' on failure.
+ */
+function _getForegroundTitle() {
+  if (IS_WIN && _GetForegroundWindow) {
+    try {
+      const hwnd = _GetForegroundWindow();
+      const buf = Buffer.alloc(256);
+      const len = _GetWindowTextA(hwnd, buf, 256);
+      return buf.toString('utf8', 0, len);
+    } catch {
+      return '';
+    }
+  }
+  if (IS_MAC) {
+    try {
+      return execSync(`osascript -e 'tell application "System Events" to set frontApp to first application process whose frontmost is true
+try
+  set winTitle to name of front window of frontApp
+on error
+  set winTitle to name of frontApp
+end try
+return winTitle'`, { timeout: 3000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    } catch {
+      return '';
+    }
+  }
+  return '';
 }
 
 // ---------------------------------------------------------------------------
@@ -29,7 +72,13 @@ const APP_DEBUG_PORTS = {
   obsidian: 9230, teams: 9231,
 };
 
-const APP_LAUNCH_COMMANDS = {
+// Platform-specific launch commands for Electron apps
+const APP_LAUNCH_COMMANDS = IS_MAC ? {
+  // macOS — Electron app CDP launch is not yet implemented.
+  // Chrome is handled separately in autoConnectOrLaunchChrome().
+  vscode: 'code --remote-debugging-port=9223',
+} : {
+  // Windows
   discord: '%LOCALAPPDATA%\\Discord\\Update.exe --processStart Discord.exe --process-start-args="--remote-debugging-port=9224"',
   spotify: '%APPDATA%\\Spotify\\Spotify.exe --remote-debugging-port=9227',
   slack: '%LOCALAPPDATA%\\slack\\slack.exe --remote-debugging-port=9225',
@@ -39,7 +88,7 @@ const APP_LAUNCH_COMMANDS = {
   teams: '%LOCALAPPDATA%\\Microsoft\\Teams\\current\\Teams.exe --remote-debugging-port=9231',
 };
 
-// Title fragments → app name mapping
+// Title fragments → app name mapping (cross-platform)
 const TITLE_TO_APP = [
   { pattern: /discord/i, app: 'discord' },
   { pattern: /spotify/i, app: 'spotify' },
@@ -62,7 +111,7 @@ let page = null;      // Current Chrome page
 const connections = {}; // { appName: { browser, page, port, appName } }
 
 // ---------------------------------------------------------------------------
-// Chrome CDP (existing functionality — unchanged)
+// Chrome CDP (cross-platform)
 // ---------------------------------------------------------------------------
 
 /**
@@ -103,13 +152,92 @@ async function connectToChrome() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Platform-specific Chrome detection and launch helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Check if Chrome is currently running.
+ * Returns Promise<boolean>.
+ */
+function _isChromeRunning() {
+  return new Promise((resolve) => {
+    if (IS_WIN) {
+      exec('tasklist /FI "IMAGENAME eq chrome.exe" /NH', { windowsHide: true }, (err, stdout) => {
+        resolve(stdout && stdout.toLowerCase().includes('chrome.exe'));
+      });
+    } else if (IS_MAC) {
+      exec('pgrep -x "Google Chrome"', (err, stdout) => {
+        resolve(!err && stdout.trim().length > 0);
+      });
+    } else {
+      exec('pgrep -x chrome || pgrep -x chromium', (err, stdout) => {
+        resolve(!err && stdout.trim().length > 0);
+      });
+    }
+  });
+}
+
+/**
+ * Get the Chrome user data directory for the current platform.
+ * Returns path string or null.
+ */
+function _getChromeUserDataDir() {
+  if (IS_WIN) {
+    return process.env.LOCALAPPDATA
+      ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'User Data')
+      : null;
+  }
+  if (IS_MAC) {
+    return path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome');
+  }
+  // Linux
+  return path.join(os.homedir(), '.config', 'google-chrome');
+}
+
+/**
+ * Get a temp directory path for a debug Chrome profile.
+ */
+function _getDebugProfileDir() {
+  if (IS_WIN) {
+    const base = process.env.TEMP || path.join(process.env.LOCALAPPDATA || '', 'Temp');
+    return path.join(base, 'chrome-cdp-debug');
+  }
+  return path.join(os.tmpdir(), 'chrome-cdp-debug');
+}
+
+/**
+ * Launch Chrome with remote debugging port.
+ * @param {string|null} userDataDir - optional user data dir
+ * @param {object} opts - { noFirstRun: bool }
+ */
+function _launchChrome(userDataDir, opts = {}) {
+  if (IS_WIN) {
+    const udArg = userDataDir ? ` --user-data-dir="${userDataDir}"` : '';
+    const nfr = opts.noFirstRun ? ' --no-first-run' : '';
+    exec(`start "" "chrome" --remote-debugging-port=9222${udArg}${nfr}`, { shell: true, windowsHide: true });
+  } else if (IS_MAC) {
+    // On macOS, use 'open' to launch Chrome with args
+    const args = ['--remote-debugging-port=9222'];
+    if (userDataDir) args.push(`--user-data-dir=${userDataDir}`);
+    if (opts.noFirstRun) args.push('--no-first-run');
+    const argsStr = args.join(' ');
+    exec(`open -na "Google Chrome" --args ${argsStr}`);
+  } else {
+    // Linux fallback
+    const udArg = userDataDir ? ` --user-data-dir="${userDataDir}"` : '';
+    const nfr = opts.noFirstRun ? ' --no-first-run' : '';
+    exec(`google-chrome --remote-debugging-port=9222${udArg}${nfr} &`, { shell: true });
+  }
+}
+
 /**
  * Auto-connect to Chrome or launch it with CDP debug port.
  * Flow:
  * 1. Try existing CDP connection on port 9222
  * 2. If fails, detect if Chrome is running without debug port
  * 3. If Chrome isn't running, launch with --remote-debugging-port=9222
- * 4. If Chrome IS running (no CDP), launch a new instance with debug port + user profile
+ * 4. If Chrome IS running (no CDP), launch a new instance with debug port + temp profile
  * Returns { connected: bool, message: string }
  */
 async function autoConnectOrLaunchChrome() {
@@ -119,25 +247,15 @@ async function autoConnectOrLaunchChrome() {
     return { connected: true, message: 'Connected to existing Chrome CDP' };
   }
 
-  // Detect Chrome user data directory (for preserving profile)
-  const userDataDir = process.env.LOCALAPPDATA
-    ? `${process.env.LOCALAPPDATA}\\Google\\Chrome\\User Data`
-    : null;
+  const userDataDir = _getChromeUserDataDir();
 
   // Check if any Chrome is running
-  const isRunning = await new Promise((resolve) => {
-    exec('tasklist /FI "IMAGENAME eq chrome.exe" /NH', { windowsHide: true }, (err, stdout) => {
-      resolve(stdout && stdout.toLowerCase().includes('chrome.exe'));
-    });
-  });
+  const isRunning = await _isChromeRunning();
 
   if (!isRunning) {
     // Chrome not running — launch with debug port and user's existing profile
     console.log('[browser] Chrome not running — launching with CDP debug port...');
-    const cmd = userDataDir
-      ? `start "" "chrome" --remote-debugging-port=9222 --user-data-dir="${userDataDir}"`
-      : `start "" "chrome" --remote-debugging-port=9222`;
-    exec(cmd, { shell: true, windowsHide: true });
+    _launchChrome(userDataDir);
 
     // Wait for Chrome to start — use HTTP check for faster detection
     for (let attempt = 0; attempt < 8; attempt++) {
@@ -154,14 +272,8 @@ async function autoConnectOrLaunchChrome() {
   // Chrome IS running but without debug port
   // Launch a secondary instance with a separate debugging profile
   console.log('[browser] Chrome running without CDP. Launching debug instance...');
-  const debugProfile = process.env.TEMP
-    ? `${process.env.TEMP}\\chrome-cdp-debug`
-    : `${process.env.LOCALAPPDATA || ''}\\Temp\\chrome-cdp-debug`;
-
-  exec(
-    `start "" "chrome" --remote-debugging-port=9222 --user-data-dir="${debugProfile}" --no-first-run`,
-    { shell: true, windowsHide: true }
-  );
+  const debugProfile = _getDebugProfileDir();
+  _launchChrome(debugProfile, { noFirstRun: true });
 
   for (let attempt = 0; attempt < 8; attempt++) {
     await new Promise((r) => setTimeout(r, 800));
@@ -172,9 +284,13 @@ async function autoConnectOrLaunchChrome() {
     }
   }
 
+  const hint = IS_MAC
+    ? 'Close all Chrome windows and try again, or launch Chrome from terminal: open -na "Google Chrome" --args --remote-debugging-port=9222'
+    : 'Close all Chrome windows and try again, or restart Chrome with: chrome --remote-debugging-port=9222';
+
   return {
     connected: false,
-    message: 'Chrome is running but without --remote-debugging-port=9222. Close all Chrome windows and try again, or restart Chrome with: chrome --remote-debugging-port=9222',
+    message: `Chrome is running but without --remote-debugging-port=9222. ${hint}`,
   };
 }
 
@@ -249,7 +365,7 @@ async function getPageContext() {
 }
 
 // ---------------------------------------------------------------------------
-// Electron app CDP connections (NEW)
+// Electron app CDP connections
 // ---------------------------------------------------------------------------
 
 /**
@@ -315,17 +431,28 @@ async function connectToApp(appName) {
 async function launchAndConnect(appName) {
   const key = appName.toLowerCase();
   const cmd = APP_LAUNCH_COMMANDS[key];
-  if (!cmd) return null;
+  if (!cmd) {
+    if (IS_MAC) {
+      console.warn(`[browser] Electron app CDP launch for "${key}" is not yet supported on macOS.`);
+    }
+    return null;
+  }
 
-  // Kill existing instance
+  // Kill existing instance — platform-specific
   try {
     const { execSync } = require('child_process');
-    execSync(`taskkill /IM ${key}.exe /F 2>nul`, { windowsHide: true });
+    if (IS_WIN) {
+      execSync(`taskkill /IM ${key}.exe /F 2>nul`, { windowsHide: true });
+    } else if (IS_MAC) {
+      execSync(`pkill -f "${key}" 2>/dev/null || true`, { stdio: 'pipe' });
+    } else {
+      execSync(`pkill -f "${key}" 2>/dev/null || true`, { stdio: 'pipe' });
+    }
   } catch { /* not running — fine */ }
 
   // Launch with debug port
   return new Promise((resolve) => {
-    exec(cmd, { windowsHide: true, shell: true });
+    exec(cmd, { shell: true });
 
     // Wait for app to start, then connect
     setTimeout(async () => {
@@ -340,16 +467,13 @@ async function launchAndConnect(appName) {
  * Returns { type: 'cdp', connection, appName } or { type: 'native', appName, title }.
  */
 async function detectCurrentApp() {
-  if (!_GetForegroundWindow) {
+  // On Windows use koffi, on macOS use AppleScript
+  const title = _getForegroundTitle();
+  if (!title) {
     return { type: 'none', appName: null, title: '' };
   }
 
   try {
-    const hwnd = _GetForegroundWindow();
-    const buf = Buffer.alloc(256);
-    const len = _GetWindowTextA(hwnd, buf, 256);
-    const title = buf.toString('utf8', 0, len);
-
     // Map title to known app
     for (const { pattern, app } of TITLE_TO_APP) {
       if (pattern.test(title)) {
@@ -357,6 +481,15 @@ async function detectCurrentApp() {
         const conn = await connectToApp(app);
         if (conn) {
           return { type: 'cdp', connection: conn, appName: app };
+        }
+        // On macOS, Electron app CDP is mostly unsupported — give clear message
+        if (IS_MAC && app !== 'chrome') {
+          return {
+            type: 'native',
+            appName: app,
+            title,
+            note: `Electron app CDP for ${app} is not yet supported on macOS. Use keyboard shortcuts instead.`,
+          };
         }
         return { type: 'native', appName: app, title };
       }
@@ -402,7 +535,7 @@ async function getAppPageContext(appName) {
 }
 
 // ---------------------------------------------------------------------------
-// Browser actions (existing — unchanged)
+// Browser actions (cross-platform — these use Playwright which is already cross-platform)
 // ---------------------------------------------------------------------------
 
 async function cdpClick(selector) {
