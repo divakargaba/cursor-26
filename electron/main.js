@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const {
   app,
+  BrowserWindow,
   globalShortcut,
   ipcMain,
   nativeImage,
@@ -13,10 +14,12 @@ const { menubar } = require('menubar');
 const Agent = require('../src/agent');
 const Computer = require('../src/computer');
 const browser = require('../src/browser');
+const { loadCalibration, runCalibration, validateCalibration } = require('../src/calibration');
 
 let mb = null;
 let agent = null;
 let computer = null;
+let calibration = null;
 let isQuitting = false;
 
 // Single instance lock
@@ -149,14 +152,21 @@ async function captureScreen() {
     const scaleFactor = primaryDisplay.scaleFactor || 1;
     const sources = await desktopCapturer.getSources({
       types: ['screen'],
-      thumbnailSize: { width, height },
+      thumbnailSize: { width: Math.round(width * scaleFactor), height: Math.round(height * scaleFactor) },
     });
     if (sources.length === 0) return { ok: false, error: 'No screen sources' };
     const thumb = sources[0].thumbnail;
     const imgSize = thumb.getSize();
     console.log(`[screenshot] display: ${width}x${height} logical, scaleFactor=${scaleFactor}, thumbnail: ${imgSize.width}x${imgSize.height}`);
     const jpeg = thumb.toJPEG(50);
-    return { ok: true, data: jpeg.toString('base64'), mediaType: 'image/jpeg', scaleFactor, logicalWidth: width, logicalHeight: height };
+    return {
+      ok: true,
+      data: jpeg.toString('base64'),
+      mediaType: 'image/jpeg',
+      scaleFactor,
+      logicalWidth: width,
+      logicalHeight: height,
+    };
   } catch (err) {
     return { ok: false, error: err.message };
   }
@@ -258,7 +268,7 @@ ipcMain.handle('transcribe-audio', async (_event, { audioBase64 }) => {
 
 app.whenReady().then(async () => {
   mb = menubar({
-    index: `file://${path.join(__dirname, 'panel.html')}`,
+    index: `file:///${path.join(__dirname, 'panel.html').replace(/\\/g, '/')}`,
     icon: createTrayIcon('#666666'),
     tooltip: 'AI Assistant',
     preloadWindow: true,
@@ -286,7 +296,23 @@ app.whenReady().then(async () => {
     computer = new Computer();
     console.log('[startup] Computer control ready');
 
-    // Try to connect to Chrome CDP — auto-launch debug instance if needed.
+    // Screen calibration — verify physical cursor positioning
+    try {
+      const primaryDisplay = screen.getPrimaryDisplay();
+      calibration = loadCalibration();
+      calibration = validateCalibration(calibration, primaryDisplay);
+      if (!calibration) {
+        console.log('[startup] Running physical coordinate verification...');
+        calibration = await runCalibration({ screenshotFn: captureScreen });
+        console.log(`[startup] Calibration done: ${calibration.screenshot_width}x${calibration.screenshot_height} physical pixels, max error ${calibration.accuracy.max_error_px}px`);
+      } else {
+        console.log(`[startup] Loaded calibration: ${calibration.screenshot_width}x${calibration.screenshot_height} physical pixels`);
+      }
+    } catch (err) {
+      console.warn('[startup] Calibration failed (continuing without):', err.message);
+    }
+
+    // Try to connect to Chrome CDP — connect only (never launch)
     let cdpResult = { connected: false, message: 'Skipped' };
     try {
       cdpResult = await browser.autoConnectOrLaunchChrome();

@@ -13,11 +13,12 @@ const COL_LABELS = 'ABCDEFGHIJKL'.split('');
 const ROW_LABELS = '12345678'.split('');
 
 /**
- * Build a mapping of grid cell labels → pixel regions.
- * @param {number} imgWidth  - screenshot width in pixels
- * @param {number} imgHeight - screenshot height in pixels
- * @returns {Object} { cellMap: { "A1": { x, y, cx, cy, w, h }, ... }, cols, rows }
- *   x,y = top-left corner; cx,cy = center point (click target); w,h = cell size
+ * Build a mapping of grid cell labels → physical pixel coordinates.
+ * Screenshot pixels = physical pixels = SetPhysicalCursorPos coordinates (1:1).
+ * @param {number} imgWidth  - screenshot width in physical pixels
+ * @param {number} imgHeight - screenshot height in physical pixels
+ * @returns {Object} { cellMap, cols, rows, cellW, cellH }
+ *   cellMap values have x,y,cx,cy,w,h in physical pixel coordinates
  */
 function buildGridMap(imgWidth, imgHeight) {
   const cellW = Math.floor(imgWidth / GRID_COLS);
@@ -27,13 +28,13 @@ function buildGridMap(imgWidth, imgHeight) {
   for (let row = 0; row < GRID_ROWS; row++) {
     for (let col = 0; col < GRID_COLS; col++) {
       const label = `${COL_LABELS[col]}${ROW_LABELS[row]}`;
-      const x = col * cellW;
-      const y = row * cellH;
+      const imgX = col * cellW;
+      const imgY = row * cellH;
       cellMap[label] = {
-        x,
-        y,
-        cx: Math.round(x + cellW / 2),
-        cy: Math.round(y + cellH / 2),
+        x: imgX,
+        y: imgY,
+        cx: Math.round(imgX + cellW / 2),
+        cy: Math.round(imgY + cellH / 2),
         w: cellW,
         h: cellH,
       };
@@ -46,8 +47,9 @@ function buildGridMap(imgWidth, imgHeight) {
 /**
  * Overlay a labeled grid onto a screenshot.
  * Draws grid lines and cell labels directly onto the image bitmap.
+ * Cell coordinates are in physical pixels (1:1 with SetPhysicalCursorPos).
  *
- * @param {Buffer} screenshotBuffer - JPEG or PNG buffer
+ * @param {Buffer} screenshotBuffer - JPEG or PNG buffer (physical pixel resolution)
  * @returns {{ annotatedBase64: string, gridMap: Object, mediaType: string }}
  */
 function overlayGrid(screenshotBuffer) {

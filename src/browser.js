@@ -6,7 +6,9 @@
 // window title detection, and Electron app paths.
 
 const { chromium } = require('playwright');
-const { exec, execSync } = require('child_process');
+const { exec, execSync, spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
 const IS_WIN = process.platform === 'win32';
 const IS_MAC = process.platform === 'darwin';
@@ -58,6 +60,44 @@ return winTitle'`, { timeout: 3000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'p
     }
   }
   return '';
+}
+
+// ---------------------------------------------------------------------------
+// Find Chrome's actual install path (not in PATH on Windows)
+// ---------------------------------------------------------------------------
+
+function findChromePath() {
+  const candidates = [
+    process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    process.env['PROGRAMFILES(X86)'] && path.join(process.env['PROGRAMFILES(X86)'], 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+  ].filter(Boolean);
+
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) return p; } catch {}
+  }
+
+  // Fallback: try registry
+  try {
+    const regOut = execSync(
+      'reg query "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe" /ve',
+      { encoding: 'utf8', windowsHide: true, timeout: 3000 }
+    );
+    const match = regOut.match(/REG_SZ\s+(.+)/);
+    if (match && fs.existsSync(match[1].trim())) return match[1].trim();
+  } catch {}
+
+  // Last resort — hope it's in PATH
+  return 'chrome';
+}
+
+let _chromePath = null;
+function getChromePath() {
+  if (!_chromePath) {
+    _chromePath = findChromePath();
+    console.log(`[browser] Chrome path: ${_chromePath}`);
+  }
+  return _chromePath;
 }
 
 // ---------------------------------------------------------------------------
@@ -535,7 +575,12 @@ async function cdpClick(selector) {
   try {
     await getCurrentPage();
     if (!page) return { ok: false, error: 'No page available' };
-    await page.click(selector, { timeout: 5000 });
+    try {
+      await page.click(selector, { timeout: 2000 });
+    } catch {
+      // Fallback: force click bypasses visibility/actionability checks
+      await page.click(selector, { timeout: 2000, force: true });
+    }
     return { ok: true };
   } catch (err) {
     console.error('[browser] cdpClick error:', err.message);
@@ -547,8 +592,40 @@ async function cdpClickText(text) {
   try {
     await getCurrentPage();
     if (!page) return { ok: false, error: 'No page available' };
-    await page.getByText(text, { exact: false }).first().click({ timeout: 5000 });
-    return { ok: true };
+
+    // Strategy 1: role-based (only interactive/visible elements)
+    try {
+      await page.getByRole('link', { name: text }).or(
+        page.getByRole('button', { name: text })
+      ).or(
+        page.getByRole('treeitem', { name: text })
+      ).first().click({ timeout: 2000 });
+      return { ok: true };
+    } catch {}
+
+    // Strategy 2: JS — find visible clickable element with matching text
+    const clicked = await page.evaluate((searchText) => {
+      const lower = searchText.toLowerCase();
+      const candidates = document.querySelectorAll(
+        'a, button, [role="button"], [role="link"], [role="treeitem"], [role="listitem"], [role="menuitem"], [role="tab"], li, span, div[class*="channel"], div[class*="chat"]'
+      );
+      for (const el of candidates) {
+        if (el.offsetParent === null) continue;
+        const t = (el.innerText || el.textContent || '').trim();
+        if (t.toLowerCase() === lower || t.toLowerCase().includes(lower)) {
+          const rect = el.getBoundingClientRect();
+          if (rect.height > 0 && rect.width > 0) {
+            el.scrollIntoViewIfNeeded?.();
+            el.click();
+            return true;
+          }
+        }
+      }
+      return false;
+    }, text);
+
+    if (clicked) return { ok: true };
+    return { ok: false, error: `No visible element with text "${text}" found` };
   } catch (err) {
     console.error('[browser] cdpClickText error:', err.message);
     return { ok: false, error: err.message };
@@ -572,6 +649,8 @@ async function cdpNavigate(url) {
     await getCurrentPage();
     if (!page) return { ok: false, error: 'No page available' };
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    // Bring Chrome to front so user sees what's happening
+    try { await page.bringToFront(); } catch {}
     return { ok: true };
   } catch (err) {
     console.error('[browser] cdpNavigate error:', err.message);
@@ -579,11 +658,25 @@ async function cdpNavigate(url) {
   }
 }
 
+async function bringBrowserToFront() {
+  try {
+    await getCurrentPage();
+    if (page) await page.bringToFront();
+  } catch {}
+}
+
+const KEY_ALIASES = {
+  'return': 'Enter', 'esc': 'Escape', 'del': 'Delete', 'ins': 'Insert',
+  'cmd': 'Meta', 'command': 'Meta', 'ctrl': 'Control', 'option': 'Alt',
+  'space': ' ', 'spacebar': ' ',
+};
+
 async function cdpPressKey(key) {
   try {
     await getCurrentPage();
     if (!page) return { ok: false, error: 'No page available' };
-    await page.keyboard.press(key);
+    const normalized = KEY_ALIASES[key.toLowerCase()] || key;
+    await page.keyboard.press(normalized);
     return { ok: true };
   } catch (err) {
     console.error('[browser] cdpPressKey error:', err.message);
@@ -644,6 +737,8 @@ module.exports = {
   cdpNavigate,
   cdpPressKey,
   cdpScroll,
+  bringBrowserToFront,
+  getChromePath,
   cdpWaitForLoad,
   // Registry
   APP_DEBUG_PORTS,

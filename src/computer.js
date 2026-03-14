@@ -7,7 +7,6 @@
 const platform = process.platform;
 
 let Computer;
-
 if (platform === 'win32') {
   Computer = require('./computer.windows');
 } else if (platform === 'darwin') {
