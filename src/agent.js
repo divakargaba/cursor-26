@@ -7,9 +7,9 @@ const crypto = require('crypto');
 const Memory = require('./memory');
 const { overlayGrid, resolveCell } = require('./grid-overlay');
 
-const MODEL = 'claude-haiku-4-5-20251001';
+const MODEL = 'claude-sonnet-4-5-20241022';
 const MAX_TOKENS = 4096;
-const MAX_ITERATIONS = 15;
+const MAX_ITERATIONS = 8;
 const MAX_HISTORY = 20;
 
 // Loop detection thresholds (hash-based, from OpenClaw)
@@ -45,7 +45,7 @@ const tools = [
     input_schema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['read_screen', 'click', 'type', 'key', 'scroll', 'run_command', 'focus_window'] },
+        action: { type: 'string', enum: ['read_screen', 'click', 'type', 'key', 'scroll', 'run_command', 'focus_window', 'open_app'] },
         target: { type: 'string' },
         value: { type: 'string' },
         x: { type: 'number' },
@@ -80,78 +80,51 @@ const tools = [
 // System prompt
 // ---------------------------------------------------------------------------
 
-const SYSTEM_PROMPT = `You are a voice-first AI copilot controlling a computer alongside a tired user.
+const SYSTEM_PROMPT = `You control a Windows PC. Short voice replies (1-2 sentences). No narration — just tool calls.
 
-VOICE: Keep spoken replies to 1-2 sentences. Casual and warm. Never bullet lists.
+RULES:
+1. Return ALL tool calls in ONE response. Every extra round = 3s wasted.
+2. ALWAYS focus_window BEFORE type/key on native apps.
+3. NEVER take screenshots to "check" — trust tool results. Only screenshot if you truly don't know what's on screen.
+4. NEVER guess pixel coordinates. Use keyboard shortcuts or element names.
+5. If stuck after 2 tries, TELL the user. Don't loop.
 
-SPEED IS EVERYTHING — RETURN ALL ACTIONS IN ONE RESPONSE:
-- You MUST return ALL tool calls for a task in a SINGLE response. Every extra round-trip wastes 3-5 seconds.
-- GOOD: focus_window + key + type + key = 4 tool calls, 1 response, ~5 seconds total.
-- BAD: focus_window (wait) → key (wait) → type (wait) → key = 4 responses, 20+ seconds.
-- For known tasks, you already know the steps. Do them ALL at once:
-  - "type hello in notepad" → focus_window(notepad) + type(hello). Done. 1 response.
-  - "text Mixo on Discord" → focus_window(discord) + key(ctrl+k) + type(Mixo) + key(enter) + type(message) + key(enter). All in 1 response.
-  - "open Google Docs and type something" → navigate(docs.new) in response 1, then read_page + click + type in response 2. Max 2 responses.
+RECIPES (use these EXACT sequences):
 
-FOCUS MANAGEMENT — CRITICAL:
-- The overlay is always visible but NEVER has keyboard focus.
-- Before ANY type/key/click action on a native app, call focus_window FIRST in the same response.
-- focus_window takes a title pattern (regex) to find and focus the target window.
-- Example patterns: "Notepad", "Discord", "Spotify", "Visual Studio Code"
-- Without focus_window, keystrokes go to the WRONG window.
+"type X in Notepad" →
+  focus_window("Notepad") + type("X")
 
-CLICK TARGETING — 3-TIER SYSTEM (never guess coordinates):
-Tier 1 — ELEMENT NAMES (best): read_screen returns UI elements with exact coordinates from Windows UIAutomation.
-  - Use target="button name" to click elements by name — pixel-perfect accuracy.
-  - Always try read_screen FIRST for native apps.
-Tier 2 — GRID CELLS (good): take_screenshot returns an image with a labeled grid (A1 through L8, 12 cols × 8 rows).
-  - Use cell="F4" in native_action click — maps to the center of that grid cell.
-  - Sub-cell: append -TL, -TR, -BL, -BR (e.g. cell="F4-TL" for top-left quarter).
-  - Use this when read_screen finds no elements (Electron/custom UI apps).
-Tier 3 — RAW COORDINATES (last resort): Only use x/y if tiers 1 and 2 fail.
-  - NEVER guess coordinates from a screenshot image. ALWAYS derive them from read_screen elements or grid cells.
+"open Discord" or "open Notepad" →
+  open_app(target="discord") — finds running app or launches it, brings to front
 
-ACTION VERIFICATION — CRITICAL (do not hallucinate):
-- After type/key/click, the result tells you the active window title. CHECK IT.
-- If the result says "WARNING: Window focus may have changed" — the text likely went to the WRONG window. Take a screenshot to verify.
-- NEVER claim you typed or clicked successfully without evidence. The tool result only confirms the ACTION was sent, NOT that it landed correctly.
-- After typing into an app, take_screenshot to VERIFY the text actually appeared. Do NOT assume success.
-- If clicking didn't change anything (same window title, no expected result), DON'T retry the same click.
-- Instead: try a DIFFERENT approach — keyboard shortcut, different element, or ask the user.
-- If you've tried 2+ times with no progress, take_screenshot to see what actually happened.
+"message USER on Discord" →
+  open_app(target="discord") then key("ctrl+k") + type("USER") + key("enter") + type("MESSAGE") + key("enter")
 
-BROWSER (browser_action):
-- Use for ANYTHING in a browser. It's instant via CDP — no screenshots needed.
-- Chrome is auto-connected via CDP. If not connected, it will auto-launch.
-- After navigate: read_page in the SAME response or next one.
-- read_page gives you the full DOM — use element IDs, selectors, or text to target clicks/types.
-- click_selector and click_text are PRECISE — they use CSS selectors, not coordinates.
+"open URL" →
+  browser_action navigate URL → browser_action read_page
 
-ELECTRON APPS (Discord, Spotify, Slack, VS Code, Figma, Notion, WhatsApp, Obsidian, Teams):
-- Use native_action with keyboard shortcuts. CDP is NOT available for these.
-- KEYBOARD SHORTCUTS are fast and reliable for Electron apps:
-  - Discord: Ctrl+K opens quick switcher, type channel/user name, Enter to select, then type message, then Enter TO SEND.
-  - Spotify: Ctrl+K for search. Space to play/pause.
-  - Slack: Ctrl+K for quick switcher, type channel name, Enter.
-- ALWAYS press Enter after typing a message to SEND it. Typing without Enter just leaves text in the box.
-- Full sequence for "send X in Discord #general": focus_window(Discord) → key(ctrl+k) → type(general) → key(enter) → type(X) → key(enter).
+"click BUTTON in native app" →
+  focus_window("app") + click(target="BUTTON")
 
 NATIVE APPS (native_action):
-- For non-browser, non-Electron apps (Notepad, File Explorer, Excel, etc.)
-- ALWAYS call focus_window before type/key/click actions.
-- Use read_screen to see available UI elements with exact positions BEFORE clicking.
-- read_screen uses Windows UIAutomation (buttons, text fields, menus with bounding rects).
-- run_command to open apps.
+- focus_window first, always. Pattern is regex: "Notepad", "Discord", "Spotify"
+- type = clipboard paste into focused app
+- key = keyboard shortcut: "ctrl+k", "enter", "ctrl+a", "ctrl+c"
+- click with target="element name" (from read_screen) — NOT raw x/y
+- open_app(target="appname") to launch/focus apps: discord, spotify, notepad, chrome, slack
+- run_command for shell commands only, NOT for opening apps (use open_app instead)
 
-SCREENSHOT (take_screenshot):
-- Returns a grid-labeled screenshot. Use the grid labels (A1-L8) to identify click targets.
-- After getting a screenshot, use cell="A3" in native_action click, not raw pixel guesses.
-- Grid cells are ~160x135 pixels each. For precise targeting, use sub-cell (-TL, -TR, -BL, -BR).
+DISCORD (native desktop app):
+- Ctrl+K = quick switcher. Type person/channel name, Enter to select.
+- Then type your message, then Enter to send.
+- ALL IN ONE RESPONSE: focus_window + key(ctrl+k) + type(name) + key(enter) + type(msg) + key(enter)
 
-CONFIRMATIONS (request_confirmation):
-- ALWAYS before send/submit/delete/purchase. Never skip.
+BROWSER (browser_action):
+- For websites only. CDP auto-connects to Chrome.
+- navigate, read_page, click_selector, click_text, type, press_key, scroll
+- click_text finds visible elements by text. click_selector uses CSS selectors.
 
-If stuck after a few tries, TELL THE USER what's happening. Don't silently retry the same thing.`;
+CONFIRMATIONS: request_confirmation before send/delete/purchase.`;
 
 // ---------------------------------------------------------------------------
 // Agent class
@@ -180,6 +153,7 @@ class Agent {
     this._currentActions = []; // track actions for memory recording
     this._activeElectronApp = null; // currently CDP-connected Electron app
     this._lastGridMap = null; // grid cell map from last screenshot
+    this._lastToolType = null; // track for browser→native transitions
   }
 
   // =========================================================================
@@ -249,14 +223,17 @@ class Agent {
    * Screenshots are ONLY taken when Claude explicitly calls take_screenshot.
    */
   async _gatherContext() {
+    console.time('[agent] gatherContext');
+
     // 1. Try Chrome browser context (CDP — instant structured data)
     try {
       if (this.browser && typeof this.browser.isConnected === 'function' && this.browser.isConnected()) {
         const pageCtx = await this.browser.getPageContext();
         if (pageCtx) {
+          console.timeEnd('[agent] gatherContext');
           return {
             type: 'browser',
-            text: `[Browser] URL: ${pageCtx.url}\nTitle: ${pageCtx.title}\nElements (${pageCtx.elements.length}): ${JSON.stringify(pageCtx.elements.slice(0, 80))}`,
+            text: `[Browser] ${pageCtx.url} "${pageCtx.title}"\n${pageCtx.elements.slice(0, 30).map(e => `${e.tag}${e.id ? '#'+e.id : ''} "${(e.text||'').slice(0,40)}"`).join('\n')}`,
           };
         }
       }
@@ -272,9 +249,10 @@ class Agent {
           this._activeElectronApp = detected.appName;
           const appCtx = await this.browser.getAppPageContext(detected.appName);
           if (appCtx) {
+            console.timeEnd('[agent] gatherContext');
             return {
               type: 'electron-cdp',
-              text: `[Electron CDP: ${detected.appName}] URL: ${appCtx.url}\nTitle: ${appCtx.title}\nElements (${appCtx.elements.length}): ${JSON.stringify(appCtx.elements.slice(0, 80))}\n\nThis is an Electron app connected via CDP — browser_action tools work here.`,
+              text: `[Electron CDP: ${detected.appName}] ${appCtx.url} "${appCtx.title}"\n${appCtx.elements.slice(0, 30).map(e => `${e.tag}${e.id ? '#'+e.id : ''} "${(e.text||'').slice(0,40)}"`).join('\n')}\n\nbrowser_action works here.`,
             };
           }
         }
@@ -291,6 +269,7 @@ class Agent {
           const rows = uiInfo.elements.map((e) =>
             `  [${e.type}] "${e.name}" at (${e.x}, ${e.y}) ${e.w}x${e.h}`
           );
+          console.timeEnd('[agent] gatherContext');
           return {
             type: 'native',
             text: `[Native app] Window: ${uiInfo.window}\nElements (${uiInfo.elements.length}):\n${rows.join('\n')}`,
@@ -301,12 +280,13 @@ class Agent {
       console.error('[agent] native context error:', err.message);
     }
 
-    // 4. Get window list as TEXT context (no screenshot — forces commands + shortcuts)
+    // 4. Window list (fast fallback)
     try {
       if (this.computer && typeof this.computer.listWindows === 'function') {
         const windows = await this.computer.listWindows();
         if (windows && windows.length > 0) {
           const list = windows.map((w) => `  [${w.ProcessName}] ${w.MainWindowTitle}`).join('\n');
+          console.timeEnd('[agent] gatherContext');
           return {
             type: 'windows',
             text: `[No browser/native context. Open windows:]\n${list}\n\nUse native_action run_command to open/focus apps. Use keyboard shortcuts to navigate within apps. Call take_screenshot ONLY if you truly need to see the screen.`,
@@ -317,6 +297,7 @@ class Agent {
       console.error('[agent] window list error:', err.message);
     }
 
+    console.timeEnd('[agent] gatherContext');
     return {
       type: 'none',
       text: '[No context available. Use native_action run_command to open apps, keyboard shortcuts to navigate. Call take_screenshot only if needed.]',
@@ -328,6 +309,8 @@ class Agent {
   // =========================================================================
 
   async chat(text) {
+    const _chatStart = Date.now();
+    console.time('[agent] chat total');
     this.onProgress({ type: 'status', text: 'Reading screen...' });
 
     this._currentActions = [];
@@ -359,8 +342,11 @@ class Agent {
     this.onProgress({ type: 'status', text: 'Thinking...' });
 
     try {
-      return await this._runLoop();
+      const result = await this._runLoop();
+      console.timeEnd('[agent] chat total');
+      return result;
     } catch (err) {
+      console.timeEnd('[agent] chat total');
       this.history.length = historyLenBefore;
       console.error('[agent] chat error:', err);
 
@@ -382,8 +368,12 @@ class Agent {
 
     while (iterations < MAX_ITERATIONS) {
       iterations++;
+      console.log(`[agent] --- Iteration ${iterations} ---`);
+      console.time(`[agent] iteration-${iterations}`);
 
+      console.time(`[agent] API call #${iterations}`);
       const response = await this._callAPI();
+      console.timeEnd(`[agent] API call #${iterations}`);
       this.history.push({ role: 'assistant', content: response.content });
 
       const textParts = response.content
@@ -397,8 +387,12 @@ class Agent {
         return { text: textParts.join('\n') || 'Done.' };
       }
 
-      if (textParts.length > 0 && textParts.join('').trim()) {
-        this.onProgress({ type: 'text', text: textParts.join('\n') });
+      if (textParts.length > 0) {
+        const combined = textParts.join('\n').trim();
+        // Suppress narrations like "Let me try...", "I'll click..." — only forward real content
+        if (combined && !combined.match(/^(let me|i('ll| will)|now i|ok(ay)?[,.]?\s*(let|i)|trying to|sure[,!]?\s*(let|i))/i)) {
+          this.onProgress({ type: 'text', text: combined });
+        }
       }
 
       const toolResults = [];
@@ -432,7 +426,10 @@ class Agent {
 
         this._recordToolCall(tu.name, tu.input);
 
+        const toolTimer = `[agent] tool:${tu.name}:${tu.input?.action || ''}`;
+        console.time(toolTimer);
         const result = await this._executeTool(tu.name, tu.input);
+        console.timeEnd(toolTimer);
         this._currentActions.push({ tool: tu.name, input: tu.input });
 
         if (loopCheck.stuck && loopCheck.level === 'warning') {
@@ -459,6 +456,7 @@ class Agent {
       }
 
       this.history.push({ role: 'user', content: toolResults });
+      console.timeEnd(`[agent] iteration-${iterations}`);
       this.onProgress({ type: 'status', text: 'Thinking...' });
 
       if (halted) {
@@ -481,6 +479,13 @@ class Agent {
 
   async _executeTool(name, input) {
     try {
+      // Auto-blur when switching from browser to native actions
+      if (name === 'native_action' && this._lastToolType === 'browser_action') {
+        this.blurOverlayFn();
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      this._lastToolType = name;
+
       switch (name) {
         case 'browser_action':
           return await this._execBrowserAction(input);
@@ -533,18 +538,14 @@ class Agent {
         const res = await this.browser.cdpNavigate(input.url);
         if (!res.ok) return [{ type: 'text', text: `Navigation failed: ${res.error}` }];
         if (typeof this.browser.cdpWaitForLoad === 'function') {
-          await this.browser.cdpWaitForLoad(4000);
+          await this.browser.cdpWaitForLoad(1500);
         }
         const ctx = await this.browser.getPageContext();
         if (ctx) {
-          const elemSummary = ctx.elements.slice(0, 60).map((e) => {
-            const parts = [e.tag];
-            if (e.text) parts.push(`"${e.text}"`);
-            if (e.id) parts.push(`#${e.id}`);
-            if (e.role) parts.push(`role=${e.role}`);
-            return parts.join(' ');
-          }).join('\n');
-          return [{ type: 'text', text: `Navigated to ${input.url}\nURL: ${ctx.url}\nTitle: ${ctx.title}\nElements:\n${elemSummary}` }];
+          const elemSummary = ctx.elements.slice(0, 20).map((e) =>
+            `${e.tag}${e.id ? '#'+e.id : ''} "${(e.text||'').slice(0,30)}"`
+          ).join('\n');
+          return [{ type: 'text', text: `Navigated to ${input.url}\n"${ctx.title}"\n${elemSummary}` }];
         }
         return [{ type: 'text', text: `Navigated to ${input.url}` }];
       }
@@ -552,16 +553,14 @@ class Agent {
       case 'read_page': {
         const ctx = await this.browser.getPageContext();
         if (!ctx) return [{ type: 'text', text: 'Could not read page — no active page found.' }];
-        const elemSummary = ctx.elements.slice(0, 100).map((e) => {
+        const elemSummary = ctx.elements.slice(0, 30).map((e) => {
           const parts = [e.tag];
-          if (e.text) parts.push(`"${e.text}"`);
+          if (e.text) parts.push(`"${(e.text||'').slice(0,40)}"`);
           if (e.id) parts.push(`#${e.id}`);
-          if (e.role) parts.push(`role=${e.role}`);
           if (e.type) parts.push(`type=${e.type}`);
-          if (e.href) parts.push(`href=${e.href}`);
           return parts.join(' ');
         }).join('\n');
-        return [{ type: 'text', text: `URL: ${ctx.url}\nTitle: ${ctx.title}\nElements (${ctx.elements.length}):\n${elemSummary}` }];
+        return [{ type: 'text', text: `${ctx.url} "${ctx.title}"\n${elemSummary}` }];
       }
 
       case 'click_selector': {
@@ -751,6 +750,54 @@ class Agent {
         return [{ type: 'text', text: result.error }];
       }
 
+      case 'open_app': {
+        const appName = (input.target || input.value || '').toLowerCase().trim();
+        if (!appName) return [{ type: 'text', text: 'open_app requires a target app name.' }];
+
+        // First try focus_window — app might already be running
+        this.blurOverlayFn();
+        await new Promise((r) => setTimeout(r, 100));
+        const focusResult = await this.computer.focusWindow(appName);
+        if (focusResult.ok) {
+          await new Promise((r) => setTimeout(r, 200));
+          return [{ type: 'text', text: `${focusResult.title} is already open — brought to front.` }];
+        }
+
+        // Known app launch paths
+        const path = require('path');
+        const la = process.env.LOCALAPPDATA || '';
+        const APP_PATHS = {
+          discord: path.join(la, 'Discord', 'Update.exe'),
+          spotify: path.join(process.env.APPDATA || '', 'Spotify', 'Spotify.exe'),
+          slack: path.join(la, 'slack', 'slack.exe'),
+          notepad: 'notepad.exe',
+          explorer: 'explorer.exe',
+          chrome: require('./browser').getChromePath ? require('./browser').getChromePath() : 'chrome',
+        };
+
+        // Try known path
+        const knownPath = APP_PATHS[appName];
+        if (knownPath) {
+          const { spawn: sp } = require('child_process');
+          const args = appName === 'discord' ? ['--processStart', 'Discord.exe'] : [];
+          try {
+            const child = sp(knownPath, args, { detached: true, stdio: 'ignore', windowsHide: false });
+            child.unref();
+            child.on('error', () => {});
+          } catch {}
+          await new Promise((r) => setTimeout(r, 2000));
+          // Try to focus the newly opened app
+          const focus2 = await this.computer.focusWindow(appName);
+          return [{ type: 'text', text: focus2.ok ? `Opened ${appName}: ${focus2.title}` : `Launched ${appName} — waiting for it to start.` }];
+        }
+
+        // Fallback: try `start appname`
+        await this.computer.runCommand(`start ${appName}`);
+        await new Promise((r) => setTimeout(r, 1500));
+        const focus3 = await this.computer.focusWindow(appName);
+        return [{ type: 'text', text: focus3.ok ? `Opened ${appName}: ${focus3.title}` : `Tried to open ${appName}.` }];
+      }
+
       default:
         return [{ type: 'text', text: `Unknown native_action: ${action}` }];
     }
@@ -762,7 +809,7 @@ class Agent {
     const ss = await this.screenshotFn();
     if (ss && ss.ok) {
       try {
-        // Overlay grid and store the map
+        // Physical pixel coordinates — screenshot pixels = cursor pixels (1:1)
         const gridResult = overlayGrid(Buffer.from(ss.data, 'base64'));
         this._lastGridMap = gridResult.gridMap;
 

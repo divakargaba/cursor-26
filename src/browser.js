@@ -3,7 +3,9 @@
 // via --remote-debugging-port for full DOM access.
 
 const { chromium } = require('playwright');
-const { exec } = require('child_process');
+const { exec, execSync, spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
 // ---------------------------------------------------------------------------
 // Minimal koffi bindings for window detection (only GetForegroundWindow + GetWindowText)
@@ -20,6 +22,44 @@ try {
 }
 
 // ---------------------------------------------------------------------------
+// Find Chrome's actual install path (not in PATH on Windows)
+// ---------------------------------------------------------------------------
+
+function findChromePath() {
+  const candidates = [
+    process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    process.env['PROGRAMFILES(X86)'] && path.join(process.env['PROGRAMFILES(X86)'], 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+  ].filter(Boolean);
+
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) return p; } catch {}
+  }
+
+  // Fallback: try registry
+  try {
+    const regOut = execSync(
+      'reg query "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe" /ve',
+      { encoding: 'utf8', windowsHide: true, timeout: 3000 }
+    );
+    const match = regOut.match(/REG_SZ\s+(.+)/);
+    if (match && fs.existsSync(match[1].trim())) return match[1].trim();
+  } catch {}
+
+  // Last resort — hope it's in PATH
+  return 'chrome';
+}
+
+let _chromePath = null;
+function getChromePath() {
+  if (!_chromePath) {
+    _chromePath = findChromePath();
+    console.log(`[browser] Chrome path: ${_chromePath}`);
+  }
+  return _chromePath;
+}
+
+// ---------------------------------------------------------------------------
 // App registry — Electron apps and their CDP debug ports
 // ---------------------------------------------------------------------------
 
@@ -29,14 +69,16 @@ const APP_DEBUG_PORTS = {
   obsidian: 9230, teams: 9231,
 };
 
+const _la = process.env.LOCALAPPDATA || '';
+const _ad = process.env.APPDATA || '';
 const APP_LAUNCH_COMMANDS = {
-  discord: '%LOCALAPPDATA%\\Discord\\Update.exe --processStart Discord.exe --process-start-args="--remote-debugging-port=9224"',
-  spotify: '%APPDATA%\\Spotify\\Spotify.exe --remote-debugging-port=9227',
-  slack: '%LOCALAPPDATA%\\slack\\slack.exe --remote-debugging-port=9225',
-  chrome: 'start chrome --remote-debugging-port=9222',
+  discord: `"${_la}\\Discord\\Update.exe" --processStart Discord.exe --process-start-args="--remote-debugging-port=9224"`,
+  spotify: `"${_ad}\\Spotify\\Spotify.exe" --remote-debugging-port=9227`,
+  slack: `"${_la}\\slack\\slack.exe" --remote-debugging-port=9225`,
+  chrome: `"${getChromePath()}" --remote-debugging-port=9222`,
   vscode: 'code --remote-debugging-port=9223',
-  obsidian: '%LOCALAPPDATA%\\Obsidian\\Obsidian.exe --remote-debugging-port=9230',
-  teams: '%LOCALAPPDATA%\\Microsoft\\Teams\\current\\Teams.exe --remote-debugging-port=9231',
+  obsidian: `"${_la}\\Obsidian\\Obsidian.exe" --remote-debugging-port=9230`,
+  teams: `"${_la}\\Microsoft\\Teams\\current\\Teams.exe" --remote-debugging-port=9231`,
 };
 
 // Title fragments → app name mapping
@@ -121,7 +163,7 @@ async function autoConnectOrLaunchChrome() {
 
   // Detect Chrome user data directory (for preserving profile)
   const userDataDir = process.env.LOCALAPPDATA
-    ? `${process.env.LOCALAPPDATA}\\Google\\Chrome\\User Data`
+    ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'User Data')
     : null;
 
   // Check if any Chrome is running
@@ -131,45 +173,50 @@ async function autoConnectOrLaunchChrome() {
     });
   });
 
-  if (!isRunning) {
-    // Chrome not running — launch with debug port and user's existing profile
-    console.log('[browser] Chrome not running — launching with CDP debug port...');
-    const cmd = userDataDir
-      ? `start "" "chrome" --remote-debugging-port=9222 --user-data-dir="${userDataDir}"`
-      : `start "" "chrome" --remote-debugging-port=9222`;
-    exec(cmd, { shell: true, windowsHide: true });
+  const chromePath = getChromePath();
 
-    // Wait for Chrome to start — use HTTP check for faster detection
-    for (let attempt = 0; attempt < 8; attempt++) {
-      await new Promise((r) => setTimeout(r, 800));
+  // Chrome requires a NON-DEFAULT data dir for remote debugging.
+  // Using the default profile path causes: "DevTools remote debugging requires a non-default data directory"
+  const cdpProfile = path.join(process.env.TEMP || process.env.LOCALAPPDATA || '.', 'chrome-cdp-profile');
+
+  if (!isRunning) {
+    // Chrome not running — launch with debug port and a dedicated CDP profile
+    console.log('[browser] Chrome not running — launching with CDP debug port...');
+    const args = ['--remote-debugging-port=9222', `--user-data-dir=${cdpProfile}`, '--no-first-run'];
+    const child = spawn(chromePath, args, { detached: true, stdio: 'ignore', windowsHide: true });
+    child.unref();
+
+    // Initial wait — Chrome cold start takes 3-5s
+    await new Promise((r) => setTimeout(r, 3000));
+    for (let attempt = 0; attempt < 5; attempt++) {
       const alive = await _isCDPAlive(9222);
       if (alive) {
         const ok = await connectToChrome();
         if (ok) return { connected: true, message: 'Launched Chrome with CDP debug port' };
       }
+      await new Promise((r) => setTimeout(r, 2000));
     }
     return { connected: false, message: 'Launched Chrome but could not connect to CDP' };
   }
 
   // Chrome IS running but without debug port
-  // Launch a secondary instance with a separate debugging profile
+  // Launch a secondary instance with the CDP profile
   console.log('[browser] Chrome running without CDP. Launching debug instance...');
-  const debugProfile = process.env.TEMP
-    ? `${process.env.TEMP}\\chrome-cdp-debug`
-    : `${process.env.LOCALAPPDATA || ''}\\Temp\\chrome-cdp-debug`;
+  const child2 = spawn(chromePath, [
+    '--remote-debugging-port=9222',
+    `--user-data-dir=${cdpProfile}`,
+    '--no-first-run',
+  ], { detached: true, stdio: 'ignore', windowsHide: true });
+  child2.unref();
 
-  exec(
-    `start "" "chrome" --remote-debugging-port=9222 --user-data-dir="${debugProfile}" --no-first-run`,
-    { shell: true, windowsHide: true }
-  );
-
-  for (let attempt = 0; attempt < 8; attempt++) {
-    await new Promise((r) => setTimeout(r, 800));
+  await new Promise((r) => setTimeout(r, 3000));
+  for (let attempt = 0; attempt < 5; attempt++) {
     const alive = await _isCDPAlive(9222);
     if (alive) {
       const ok = await connectToChrome();
       if (ok) return { connected: true, message: 'Connected to Chrome debug instance' };
     }
+    await new Promise((r) => setTimeout(r, 2000));
   }
 
   return {
@@ -409,7 +456,12 @@ async function cdpClick(selector) {
   try {
     await getCurrentPage();
     if (!page) return { ok: false, error: 'No page available' };
-    await page.click(selector, { timeout: 5000 });
+    try {
+      await page.click(selector, { timeout: 2000 });
+    } catch {
+      // Fallback: force click bypasses visibility/actionability checks
+      await page.click(selector, { timeout: 2000, force: true });
+    }
     return { ok: true };
   } catch (err) {
     console.error('[browser] cdpClick error:', err.message);
@@ -421,8 +473,40 @@ async function cdpClickText(text) {
   try {
     await getCurrentPage();
     if (!page) return { ok: false, error: 'No page available' };
-    await page.getByText(text, { exact: false }).first().click({ timeout: 5000 });
-    return { ok: true };
+
+    // Strategy 1: role-based (only interactive/visible elements)
+    try {
+      await page.getByRole('link', { name: text }).or(
+        page.getByRole('button', { name: text })
+      ).or(
+        page.getByRole('treeitem', { name: text })
+      ).first().click({ timeout: 2000 });
+      return { ok: true };
+    } catch {}
+
+    // Strategy 2: JS — find visible clickable element with matching text
+    const clicked = await page.evaluate((searchText) => {
+      const lower = searchText.toLowerCase();
+      const candidates = document.querySelectorAll(
+        'a, button, [role="button"], [role="link"], [role="treeitem"], [role="listitem"], [role="menuitem"], [role="tab"], li, span, div[class*="channel"], div[class*="chat"]'
+      );
+      for (const el of candidates) {
+        if (el.offsetParent === null) continue;
+        const t = (el.innerText || el.textContent || '').trim();
+        if (t.toLowerCase() === lower || t.toLowerCase().includes(lower)) {
+          const rect = el.getBoundingClientRect();
+          if (rect.height > 0 && rect.width > 0) {
+            el.scrollIntoViewIfNeeded?.();
+            el.click();
+            return true;
+          }
+        }
+      }
+      return false;
+    }, text);
+
+    if (clicked) return { ok: true };
+    return { ok: false, error: `No visible element with text "${text}" found` };
   } catch (err) {
     console.error('[browser] cdpClickText error:', err.message);
     return { ok: false, error: err.message };
@@ -446,6 +530,8 @@ async function cdpNavigate(url) {
     await getCurrentPage();
     if (!page) return { ok: false, error: 'No page available' };
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    // Bring Chrome to front so user sees what's happening
+    try { await page.bringToFront(); } catch {}
     return { ok: true };
   } catch (err) {
     console.error('[browser] cdpNavigate error:', err.message);
@@ -453,11 +539,25 @@ async function cdpNavigate(url) {
   }
 }
 
+async function bringBrowserToFront() {
+  try {
+    await getCurrentPage();
+    if (page) await page.bringToFront();
+  } catch {}
+}
+
+const KEY_ALIASES = {
+  'return': 'Enter', 'esc': 'Escape', 'del': 'Delete', 'ins': 'Insert',
+  'cmd': 'Meta', 'command': 'Meta', 'ctrl': 'Control', 'option': 'Alt',
+  'space': ' ', 'spacebar': ' ',
+};
+
 async function cdpPressKey(key) {
   try {
     await getCurrentPage();
     if (!page) return { ok: false, error: 'No page available' };
-    await page.keyboard.press(key);
+    const normalized = KEY_ALIASES[key.toLowerCase()] || key;
+    await page.keyboard.press(normalized);
     return { ok: true };
   } catch (err) {
     console.error('[browser] cdpPressKey error:', err.message);
@@ -514,6 +614,8 @@ module.exports = {
   cdpNavigate,
   cdpPressKey,
   cdpScroll,
+  bringBrowserToFront,
+  getChromePath,
   cdpWaitForLoad,
   // Registry
   APP_DEBUG_PORTS,

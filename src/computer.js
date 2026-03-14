@@ -14,7 +14,7 @@ const kernel32 = koffi.load('kernel32.dll');
 const msvcrt = koffi.load('msvcrt.dll');
 
 // --- Mouse ---
-const SetCursorPos = user32.func('bool __stdcall SetCursorPos(int x, int y)');
+const SetPhysicalCursorPos = user32.func('bool __stdcall SetPhysicalCursorPos(int x, int y)');
 const mouse_event = user32.func('void __stdcall mouse_event(uint32_t dwFlags, int dx, int dy, int dwData, uintptr_t dwExtraInfo)');
 
 const MOUSEEVENTF_LEFTDOWN = 0x0002;
@@ -45,7 +45,12 @@ const EnumWindowsProc = koffi.proto('bool __stdcall EnumWindowsProc(void *hwnd, 
 const EnumWindows = user32.func('bool __stdcall EnumWindows(EnumWindowsProc *, intptr_t)');
 
 // --- Cursor ---
-const GetCursorPos = user32.func('bool __stdcall GetCursorPos(void *lpPoint)');
+const GetPhysicalCursorPos = user32.func('bool __stdcall GetPhysicalCursorPos(void *lpPoint)');
+
+// --- Screen metrics (physical coordinate space for SetPhysicalCursorPos) ---
+const GetSystemMetrics = user32.func('int __stdcall GetSystemMetrics(int nIndex)');
+const SM_CXSCREEN = 0;
+const SM_CYSCREEN = 1;
 
 // --- Clipboard ---
 const OpenClipboard = user32.func('bool __stdcall OpenClipboard(void *hWndNewOwner)');
@@ -223,21 +228,26 @@ class Computer {
 
   async leftClick(x, y) {
     this._validateCoords(x, y);
-    SetCursorPos(Math.round(x), Math.round(y));
+    const px = Math.round(x), py = Math.round(y);
+    SetPhysicalCursorPos(px, py);
+    const buf = Buffer.alloc(8);
+    GetPhysicalCursorPos(buf);
+    const ax = buf.readInt32LE(0), ay = buf.readInt32LE(4);
+    console.log(`[click] Physical(${px}, ${py}) → GetPhysicalCursorPos: (${ax}, ${ay})`);
     mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
     mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
   }
 
   async rightClick(x, y) {
     this._validateCoords(x, y);
-    SetCursorPos(Math.round(x), Math.round(y));
+    SetPhysicalCursorPos(Math.round(x), Math.round(y));
     mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
     mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
   }
 
   async middleClick(x, y) {
     this._validateCoords(x, y);
-    SetCursorPos(Math.round(x), Math.round(y));
+    SetPhysicalCursorPos(Math.round(x), Math.round(y));
     mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0);
     mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0);
   }
@@ -245,7 +255,7 @@ class Computer {
   async doubleClick(x, y) {
     this._validateCoords(x, y);
     const rx = Math.round(x), ry = Math.round(y);
-    SetCursorPos(rx, ry);
+    SetPhysicalCursorPos(rx, ry);
     mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
     mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
     await new Promise((r) => setTimeout(r, 30));
@@ -255,22 +265,22 @@ class Computer {
 
   async mouseMove(x, y) {
     this._validateCoords(x, y);
-    SetCursorPos(Math.round(x), Math.round(y));
+    SetPhysicalCursorPos(Math.round(x), Math.round(y));
   }
 
   async leftClickDrag(startX, startY, endX, endY) {
     this._validateCoords(startX, startY, endX, endY);
-    SetCursorPos(Math.round(startX), Math.round(startY));
+    SetPhysicalCursorPos(Math.round(startX), Math.round(startY));
     mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
     await new Promise((r) => setTimeout(r, 30));
-    SetCursorPos(Math.round(endX), Math.round(endY));
+    SetPhysicalCursorPos(Math.round(endX), Math.round(endY));
     await new Promise((r) => setTimeout(r, 30));
     mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
   }
 
   async scroll(x, y, direction, amount = 3) {
     this._validateCoords(x, y);
-    SetCursorPos(Math.round(x), Math.round(y));
+    SetPhysicalCursorPos(Math.round(x), Math.round(y));
     const clicks = (direction === 'up' || direction === 'left') ? amount * 120 : -(amount * 120);
     mouse_event(MOUSEEVENTF_WHEEL, 0, 0, clicks, 0);
   }
@@ -321,10 +331,21 @@ class Computer {
   // Cursor
   // =========================================================================
 
+  /**
+   * Get the screen dimensions in logical (DPI-scaled) coordinates.
+   * Note: Mouse operations now use physical pixel coordinates via SetPhysicalCursorPos.
+   */
+  getScreenSize() {
+    return {
+      width: GetSystemMetrics(SM_CXSCREEN),
+      height: GetSystemMetrics(SM_CYSCREEN),
+    };
+  }
+
   getCursorPosition() {
     try {
       const buf = Buffer.alloc(8); // POINT = {int X, int Y} = 8 bytes
-      GetCursorPos(buf);
+      GetPhysicalCursorPos(buf);
       return { x: buf.readInt32LE(0), y: buf.readInt32LE(4) };
     } catch {
       return { x: 0, y: 0 };
@@ -717,6 +738,22 @@ class Computer {
   // =========================================================================
 
   async runCommand(command) {
+    // Detect app-launch commands that should fire-and-forget (not wait for exit)
+    const isLaunch = /^(start\s|.*\.(exe|lnk|cmd)"?\s*$)/i.test(command.trim());
+    if (isLaunch) {
+      try {
+        const { spawn } = require('child_process');
+        const child = spawn(command, [], { shell: true, detached: true, stdio: 'ignore', windowsHide: true });
+        child.unref();
+        child.on('error', () => {}); // ignore spawn errors silently
+        // Give the app a moment to start
+        await new Promise((r) => setTimeout(r, 1500));
+        return { ok: true, stdout: `Launched: ${command}` };
+      } catch (err) {
+        return { ok: false, error: err.message };
+      }
+    }
+
     return new Promise((resolve) => {
       exec(command, { timeout: 10000, windowsHide: true }, (err, stdout, stderr) => {
         if (err && err.killed) {
