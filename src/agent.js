@@ -1,130 +1,65 @@
-// src/agent.js — 4-tool agent: browser_action, native_action, take_screenshot, request_confirmation
-// Enhanced with grid overlay for accurate click targeting
+// src/agent.js — Computer-use agent with Claude's native computer-use API
+// Hybrid: native computer-use tool + browser CDP + confirmation
 require('dotenv').config();
 const Anthropic = require('@anthropic-ai/sdk');
 const crypto = require('crypto');
 
 const Memory = require('./memory');
-const { overlayGrid, resolveCell } = require('./grid-overlay');
 
-const MODEL = 'claude-sonnet-4-5-20241022';
+// Models — dynamic switching (Haiku fast default, Sonnet accurate on retry)
+const MODEL_FAST = 'claude-haiku-4-5-20251001';
+const MODEL_ACCURATE = 'claude-sonnet-4-5';
+
 const MAX_TOKENS = 4096;
-const MAX_ITERATIONS = 8;
+const MAX_ITERATIONS = 12;
 const MAX_HISTORY = 20;
 
-// Loop detection thresholds (hash-based, from OpenClaw)
+// Loop detection thresholds
 const LOOP_HISTORY_SIZE = 15;
 const LOOP_WARNING_THRESHOLD = 4;
 const LOOP_HALT_THRESHOLD = 7;
 
-// ---------------------------------------------------------------------------
-// Tool definitions — exactly 4 tools
-// ---------------------------------------------------------------------------
-
-const tools = [
-  {
-    name: 'browser_action',
-    description: 'Control browser via CDP. ALWAYS use this first for anything on a website or Electron app with CDP connected.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        action: { type: 'string', enum: ['navigate', 'read_page', 'click_selector', 'click_text', 'type', 'scroll', 'press_key'] },
-        url: { type: 'string' },
-        selector: { type: 'string' },
-        text: { type: 'string' },
-        value: { type: 'string' },
-        direction: { type: 'string', enum: ['up', 'down'] },
-        key: { type: 'string' },
-      },
-      required: ['action'],
-    },
-  },
-  {
-    name: 'native_action',
-    description: 'Control native desktop apps (not browser) via accessibility + mouse/keyboard. IMPORTANT: Always call focus_window FIRST before type/key/click to ensure keystrokes go to the right app. For click: prefer using cell (grid label like "F4") from the last screenshot over raw x/y. read_screen gives you a list of interactive elements with exact coordinates.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        action: { type: 'string', enum: ['read_screen', 'click', 'type', 'key', 'scroll', 'run_command', 'focus_window', 'open_app'] },
-        target: { type: 'string' },
-        value: { type: 'string' },
-        x: { type: 'number' },
-        y: { type: 'number' },
-        cell: { type: 'string', description: 'Grid cell label from screenshot (e.g. "F4", "B2"). Preferred over x/y.' },
-        command: { type: 'string' },
-      },
-      required: ['action'],
-    },
-  },
-  {
-    name: 'take_screenshot',
-    description: 'Take a screenshot with grid overlay. Returns the image with labeled grid cells (A1-L8) so you can identify exact click targets. Use this when you need to see the screen to decide where to click. Prefer using the grid cell labels for clicking (e.g. cell="F4") over guessing raw pixel coordinates.',
-    input_schema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'request_confirmation',
-    description: 'ALWAYS call this before send/submit/delete/post. Shows preview, waits for user.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        summary: { type: 'string' },
-        details: { type: 'string' },
-        risks: { type: 'array', items: { type: 'string' } },
-      },
-      required: ['summary', 'details'],
-    },
-  },
-];
+// Claude computer-use key names → our VK format
+const KEY_NORMALIZE = {
+  'Return': 'enter', 'BackSpace': 'backspace', 'Tab': 'tab',
+  'Escape': 'escape', 'space': 'space', 'Delete': 'delete',
+  'Home': 'home', 'End': 'end', 'Page_Up': 'pageup', 'Page_Down': 'pagedown',
+  'Up': 'up', 'Down': 'down', 'Left': 'left', 'Right': 'right',
+  'Super_L': 'win', 'Super_R': 'win', 'Super': 'win',
+  'Control_L': 'ctrl', 'Control_R': 'ctrl', 'Control': 'ctrl',
+  'Alt_L': 'alt', 'Alt_R': 'alt',
+  'Shift_L': 'shift', 'Shift_R': 'shift',
+  'F1': 'f1', 'F2': 'f2', 'F3': 'f3', 'F4': 'f4', 'F5': 'f5', 'F6': 'f6',
+  'F7': 'f7', 'F8': 'f8', 'F9': 'f9', 'F10': 'f10', 'F11': 'f11', 'F12': 'f12',
+};
 
 // ---------------------------------------------------------------------------
 // System prompt
 // ---------------------------------------------------------------------------
 
-const SYSTEM_PROMPT = `You control a Windows PC. Short voice replies (1-2 sentences). No narration — just tool calls.
+const SYSTEM_PROMPT = `You control a Windows PC via screenshots and mouse/keyboard. Short voice replies (1-2 sentences).
+
+TOOLS:
+1. computer — screenshot, click, type, key, scroll. Your PRIMARY tool for all desktop interactions.
+2. browser_action — CDP for web pages (faster than clicking for websites). Auto-connects to Chrome.
+3. request_confirmation — ALWAYS before send/delete/purchase/submit.
 
 RULES:
-1. Return ALL tool calls in ONE response. Every extra round = 3s wasted.
-2. ALWAYS focus_window BEFORE type/key on native apps.
-3. NEVER take screenshots to "check" — trust tool results. Only screenshot if you truly don't know what's on screen.
-4. NEVER guess pixel coordinates. Use keyboard shortcuts or element names.
-5. If stuck after 2 tries, TELL the user. Don't loop.
+1. Take a screenshot first if you need to see the screen.
+2. Click targets by coordinates from screenshots — you're trained for pixel-accurate clicking.
+3. Use browser_action for web interactions when CDP is connected (faster than screenshot→click cycle).
+4. request_confirmation before any destructive or externally-visible action.
+5. If stuck after 3 tries, tell the user. Don't loop.
+6. Complete tasks efficiently — minimum screenshots, maximum action per turn.
 
-RECIPES (use these EXACT sequences):
+RECIPES:
+- "type X in Notepad" → screenshot → find Notepad → click it → type text
+- "open Discord" → key("super") → type("Discord") → key("Return")
+- "click the X button" → screenshot → left_click at the button's coordinates
+- "open URL" → browser_action navigate (faster than screenshot clicking)
+- "message USER on Discord" → find Discord window → click it → key("ctrl+k") → type("USER") → key("Return") → type("message") → key("Return")
 
-"type X in Notepad" →
-  focus_window("Notepad") + type("X")
-
-"open Discord" or "open Notepad" →
-  open_app(target="discord") — finds running app or launches it, brings to front
-
-"message USER on Discord" →
-  open_app(target="discord") then key("ctrl+k") + type("USER") + key("enter") + type("MESSAGE") + key("enter")
-
-"open URL" →
-  browser_action navigate URL → browser_action read_page
-
-"click BUTTON in native app" →
-  focus_window("app") + click(target="BUTTON")
-
-NATIVE APPS (native_action):
-- focus_window first, always. Pattern is regex: "Notepad", "Discord", "Spotify"
-- type = clipboard paste into focused app
-- key = keyboard shortcut: "ctrl+k", "enter", "ctrl+a", "ctrl+c"
-- click with target="element name" (from read_screen) — NOT raw x/y
-- open_app(target="appname") to launch/focus apps: discord, spotify, notepad, chrome, slack
-- run_command for shell commands only, NOT for opening apps (use open_app instead)
-
-DISCORD (native desktop app):
-- Ctrl+K = quick switcher. Type person/channel name, Enter to select.
-- Then type your message, then Enter to send.
-- ALL IN ONE RESPONSE: focus_window + key(ctrl+k) + type(name) + key(enter) + type(msg) + key(enter)
-
-BROWSER (browser_action):
-- For websites only. CDP auto-connects to Chrome.
-- navigate, read_page, click_selector, click_text, type, press_key, scroll
-- click_text finds visible elements by text. click_selector uses CSS selectors.
-
-CONFIRMATIONS: request_confirmation before send/delete/purchase.`;
+Keep voice replies short. No narration — just actions.`;
 
 // ---------------------------------------------------------------------------
 // Agent class
@@ -133,27 +68,90 @@ CONFIRMATIONS: request_confirmation before send/delete/purchase.`;
 class Agent {
   /**
    * @param {Object} opts
-   * @param {Object} opts.browser       - browser.js module (CDP control)
-   * @param {Object} opts.computer      - computer.js module (native control)
-   * @param {Function} opts.screenshotFn - async () => { ok, data, mediaType, error }
-   * @param {Function} opts.onProgress   - ({ type: 'status'|'text', text }) => void
-   * @param {Function} opts.onConfirmationRequest - async ({ summary, details, risks }) => { confirmed: bool, reason? }
+   * @param {Object} opts.browser        - browser.js module (CDP control)
+   * @param {Object} opts.computer       - computer.js module (native control)
+   * @param {Function} opts.screenshotFn  - async () => { ok, data, mediaType }  (downscaled)
+   * @param {Function} opts.blurOverlayFn - () => void
+   * @param {Function} opts.onProgress    - ({ type, text }) => void
+   * @param {Function} opts.onConfirmationRequest - async (preview) => { confirmed, reason? }
+   * @param {Object} opts.displayConfig   - { physicalWidth, physicalHeight, displayWidth, displayHeight, scaleX, scaleY }
    */
-  constructor({ browser, computer, screenshotFn, blurOverlayFn, onProgress, onConfirmationRequest }) {
+  constructor({ browser, computer, screenshotFn, blurOverlayFn, onProgress, onConfirmationRequest, displayConfig }) {
     this.client = new Anthropic();
     this.browser = browser;
     this.computer = computer;
     this.screenshotFn = screenshotFn;
-    this.blurOverlayFn = blurOverlayFn || (() => { });
-    this.onProgress = onProgress || (() => { });
+    this.blurOverlayFn = blurOverlayFn || (() => {});
+    this.onProgress = onProgress || (() => {});
     this.onConfirmationRequest = onConfirmationRequest || (async () => ({ confirmed: false, reason: 'No confirmation handler' }));
+
+    // Display config for coordinate scaling
+    this.displayConfig = displayConfig || {
+      physicalWidth: 1920, physicalHeight: 1080,
+      displayWidth: 1024, displayHeight: 576,
+      scaleX: 1.875, scaleY: 1.875,
+    };
+
     this.history = [];
-    this.toolCallHistory = []; // for loop detection
+    this.toolCallHistory = [];
     this.memory = new Memory();
-    this._currentActions = []; // track actions for memory recording
-    this._activeElectronApp = null; // currently CDP-connected Electron app
-    this._lastGridMap = null; // grid cell map from last screenshot
-    this._lastToolType = null; // track for browser→native transitions
+    this._currentActions = [];
+    this._lastToolType = null;
+
+    // Model switching state
+    this._currentModel = MODEL_FAST;
+    this._retryCount = 0;
+    this._lastScreenshotHash = null;
+
+    console.log(`[computer-use] Display: ${this.displayConfig.displayWidth}x${this.displayConfig.displayHeight} (scaled from ${this.displayConfig.physicalWidth}x${this.displayConfig.physicalHeight}, factor ${this.displayConfig.scaleX.toFixed(1)}x)`);
+  }
+
+  // =========================================================================
+  // Tool definitions — hybrid: native computer-use + custom tools
+  // =========================================================================
+
+  _getTools() {
+    return [
+      // Claude's native computer-use tool (trained for pixel-accurate interaction)
+      {
+        type: 'computer_20250124',
+        name: 'computer',
+        display_width_px: this.displayConfig.displayWidth,
+        display_height_px: this.displayConfig.displayHeight,
+      },
+      // CDP browser control (faster than screenshot-based clicking for web)
+      {
+        name: 'browser_action',
+        description: 'Control browser via CDP. Use for web page interactions — faster than screenshot clicking. Auto-connects to Chrome.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['navigate', 'read_page', 'click_selector', 'click_text', 'type', 'scroll', 'press_key'] },
+            url: { type: 'string' },
+            selector: { type: 'string' },
+            text: { type: 'string' },
+            value: { type: 'string' },
+            direction: { type: 'string', enum: ['up', 'down'] },
+            key: { type: 'string' },
+          },
+          required: ['action'],
+        },
+      },
+      // Safety confirmation
+      {
+        name: 'request_confirmation',
+        description: 'ALWAYS call before send/submit/delete/post. Shows preview, waits for user.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            summary: { type: 'string' },
+            details: { type: 'string' },
+            risks: { type: 'array', items: { type: 'string' } },
+          },
+          required: ['summary', 'details'],
+        },
+      },
+    ];
   }
 
   // =========================================================================
@@ -174,14 +172,8 @@ class Agent {
   }
 
   _recordToolCall(name, input) {
-    this.toolCallHistory.push({
-      hash: this._hashToolCall(name, input),
-      name,
-      ts: Date.now(),
-    });
-    if (this.toolCallHistory.length > LOOP_HISTORY_SIZE) {
-      this.toolCallHistory.shift();
-    }
+    this.toolCallHistory.push({ hash: this._hashToolCall(name, input), name, ts: Date.now() });
+    if (this.toolCallHistory.length > LOOP_HISTORY_SIZE) this.toolCallHistory.shift();
   }
 
   _detectLoop(name, input) {
@@ -190,118 +182,54 @@ class Agent {
 
     if (count >= LOOP_HALT_THRESHOLD) {
       return {
-        stuck: true,
-        level: 'critical',
-        count,
+        stuck: true, level: 'critical', count,
         message: `STOP: You have called ${name} with identical arguments ${count} times. You are stuck in a loop. Stop retrying and tell the user what went wrong.`,
       };
     }
-
     if (count >= LOOP_WARNING_THRESHOLD) {
       return {
-        stuck: true,
-        level: 'warning',
-        count,
-        message: `WARNING: You have called ${name} ${count} times with the same arguments. If this is not making progress, try a different approach or tell the user.`,
+        stuck: true, level: 'warning', count,
+        message: `WARNING: You have called ${name} ${count} times with the same arguments. Try a different approach or tell the user.`,
       };
     }
-
     return { stuck: false };
   }
 
-  _resetLoopDetection() {
-    this.toolCallHistory = [];
-  }
+  _resetLoopDetection() { this.toolCallHistory = []; }
 
   // =========================================================================
-  // Context gathering
+  // Context gathering (simplified — Claude uses screenshots for visual context)
   // =========================================================================
 
-  /**
-   * Build context to attach to the user message.
-   * Priority: Chrome CDP > Electron app CDP > native UI elements > window list
-   * Screenshots are ONLY taken when Claude explicitly calls take_screenshot.
-   */
   async _gatherContext() {
-    console.time('[agent] gatherContext');
-
-    // 1. Try Chrome browser context (CDP — instant structured data)
+    // Provide quick text context: browser status + window list
     try {
       if (this.browser && typeof this.browser.isConnected === 'function' && this.browser.isConnected()) {
         const pageCtx = await this.browser.getPageContext();
         if (pageCtx) {
-          console.timeEnd('[agent] gatherContext');
-          return {
-            type: 'browser',
-            text: `[Browser] ${pageCtx.url} "${pageCtx.title}"\n${pageCtx.elements.slice(0, 30).map(e => `${e.tag}${e.id ? '#'+e.id : ''} "${(e.text||'').slice(0,40)}"`).join('\n')}`,
-          };
+          const elems = pageCtx.elements.slice(0, 15).map(e =>
+            `${e.tag}${e.id ? '#' + e.id : ''} "${(e.text || '').slice(0, 30)}"`
+          ).join('\n');
+          return `[Browser connected] ${pageCtx.url} "${pageCtx.title}"\n${elems}\n\nUse browser_action for web interactions (faster than screenshots).`;
         }
       }
     } catch (err) {
       console.error('[agent] browser context error:', err.message);
     }
 
-    // 2. Try Electron app CDP — detect focused app, try connectToApp
-    try {
-      if (this.browser && typeof this.browser.detectCurrentApp === 'function') {
-        const detected = await this.browser.detectCurrentApp();
-        if (detected.type === 'cdp' && detected.connection) {
-          this._activeElectronApp = detected.appName;
-          const appCtx = await this.browser.getAppPageContext(detected.appName);
-          if (appCtx) {
-            console.timeEnd('[agent] gatherContext');
-            return {
-              type: 'electron-cdp',
-              text: `[Electron CDP: ${detected.appName}] ${appCtx.url} "${appCtx.title}"\n${appCtx.elements.slice(0, 30).map(e => `${e.tag}${e.id ? '#'+e.id : ''} "${(e.text||'').slice(0,40)}"`).join('\n')}\n\nbrowser_action works here.`,
-            };
-          }
-        }
-      }
-    } catch (err) {
-      console.error('[agent] electron CDP context error:', err.message);
-    }
-
-    // 3. Try native UI elements (UIAutomation — works for real native apps)
-    try {
-      if (this.computer && typeof this.computer.getUIElements === 'function') {
-        const uiInfo = await this.computer.getUIElements();
-        if (uiInfo && uiInfo.elements && uiInfo.elements.length > 2) {
-          const rows = uiInfo.elements.map((e) =>
-            `  [${e.type}] "${e.name}" at (${e.x}, ${e.y}) ${e.w}x${e.h}`
-          );
-          console.timeEnd('[agent] gatherContext');
-          return {
-            type: 'native',
-            text: `[Native app] Window: ${uiInfo.window}\nElements (${uiInfo.elements.length}):\n${rows.join('\n')}`,
-          };
-        }
-      }
-    } catch (err) {
-      console.error('[agent] native context error:', err.message);
-    }
-
-    // 4. Window list (fast fallback)
     try {
       if (this.computer && typeof this.computer.listWindows === 'function') {
         const windows = await this.computer.listWindows();
         if (windows && windows.length > 0) {
-          const list = windows.map((w) => `  [${w.ProcessName}] ${w.MainWindowTitle}`).join('\n');
-          console.timeEnd('[agent] gatherContext');
-          return {
-            type: 'windows',
-            text: `[No browser/native context. Open windows:]\n${list}\n\nUse native_action run_command to open/focus apps. Use keyboard shortcuts to navigate within apps. Call take_screenshot ONLY if you truly need to see the screen.`,
-          };
+          const list = windows.slice(0, 10).map(w => `  ${w.ProcessName}: ${w.MainWindowTitle}`).join('\n');
+          return `[Open windows]\n${list}\n\nUse computer tool to interact with the desktop. Take a screenshot to see the screen.`;
         }
       }
     } catch (err) {
       console.error('[agent] window list error:', err.message);
     }
 
-    console.timeEnd('[agent] gatherContext');
-    return {
-      type: 'none',
-      text: '[No context available. Use native_action run_command to open apps, keyboard shortcuts to navigate. Call take_screenshot only if needed.]',
-    };
+    return '[Desktop ready. Use computer tool to take a screenshot and interact.]';
   }
 
   // =========================================================================
@@ -311,33 +239,36 @@ class Agent {
   async chat(text) {
     const _chatStart = Date.now();
     console.time('[agent] chat total');
-    this.onProgress({ type: 'status', text: 'Reading screen...' });
+    this.onProgress({ type: 'status', text: 'Reading context...' });
 
     this._currentActions = [];
+
+    // Check for precision hints → upgrade model
+    if (/look carefully|be precise|be accurate|look closer|try harder/i.test(text)) {
+      this._currentModel = MODEL_ACCURATE;
+      console.log('[agent] User requested precision — using accurate model');
+    }
+
     const ctx = await this._gatherContext();
 
-    // Get memory tips for any detected app
+    // Get memory tips
     let memoryTips = '';
     const detectedApp = this._detectAppFromText(text);
     if (detectedApp) {
       memoryTips = this.memory.getTipsForApp(detectedApp);
     }
 
-    const content = [{ type: 'text', text }];
-
-    if (ctx.type === 'screenshot' && ctx.image) {
-      content.push(ctx.image);
-    } else if (ctx.text) {
-      const contextWithMemory = memoryTips
-        ? `${ctx.text}\n\n${memoryTips}`
-        : ctx.text;
-      content.push({ type: 'text', text: contextWithMemory });
-    }
+    const contextText = memoryTips ? `${ctx}\n\n${memoryTips}` : ctx;
+    const content = [
+      { type: 'text', text },
+      { type: 'text', text: contextText },
+    ];
 
     const historyLenBefore = this.history.length;
     this.history.push({ role: 'user', content });
     this._trimHistory();
     this._resetLoopDetection();
+    this._retryCount = 0;
 
     this.onProgress({ type: 'status', text: 'Thinking...' });
 
@@ -368,7 +299,7 @@ class Agent {
 
     while (iterations < MAX_ITERATIONS) {
       iterations++;
-      console.log(`[agent] --- Iteration ${iterations} ---`);
+      console.log(`[agent] --- Iteration ${iterations} (model: ${this._currentModel}) ---`);
       console.time(`[agent] iteration-${iterations}`);
 
       console.time(`[agent] API call #${iterations}`);
@@ -376,43 +307,39 @@ class Agent {
       console.timeEnd(`[agent] API call #${iterations}`);
       this.history.push({ role: 'assistant', content: response.content });
 
-      const textParts = response.content
-        .filter((b) => b.type === 'text')
-        .map((b) => b.text);
-
+      const textParts = response.content.filter((b) => b.type === 'text').map((b) => b.text);
       const toolUses = response.content.filter((b) => b.type === 'tool_use');
 
+      // No tool calls → done
       if (toolUses.length === 0) {
         this._saveToMemory();
         return { text: textParts.join('\n') || 'Done.' };
       }
 
+      // Forward non-narration text to user
       if (textParts.length > 0) {
         const combined = textParts.join('\n').trim();
-        // Suppress narrations like "Let me try...", "I'll click..." — only forward real content
         if (combined && !combined.match(/^(let me|i('ll| will)|now i|ok(ay)?[,.]?\s*(let|i)|trying to|sure[,!]?\s*(let|i))/i)) {
           this.onProgress({ type: 'text', text: combined });
         }
       }
 
+      // Execute all tool calls
       const toolResults = [];
       let halted = false;
 
       for (let i = 0; i < toolUses.length; i++) {
         const tu = toolUses[i];
 
-        // Inter-action delay: apps need time to process previous actions
-        if (i > 0 && (tu.name === 'native_action' || toolUses[i - 1].name === 'native_action')) {
-          // Extra delay after focus_window — Windows needs time to fully activate the target
-          const prevAction = toolUses[i - 1]?.input?.action;
-          const delay = prevAction === 'focus_window' ? 350 : 200;
-          await new Promise((r) => setTimeout(r, delay));
+        // Inter-action delay
+        if (i > 0) {
+          await new Promise((r) => setTimeout(r, 50));
         }
 
         this.onProgress({ type: 'status', text: this._toolLabel(tu) });
 
+        // Loop detection
         const loopCheck = this._detectLoop(tu.name, tu.input);
-
         if (loopCheck.stuck && loopCheck.level === 'critical') {
           toolResults.push({
             type: 'tool_result',
@@ -479,8 +406,12 @@ class Agent {
 
   async _executeTool(name, input) {
     try {
-      // Auto-blur when switching from browser to native actions
-      if (name === 'native_action' && this._lastToolType === 'browser_action') {
+      if (name === 'computer') {
+        return await this._execComputerAction(input);
+      }
+
+      // Auto-blur when switching from browser to computer actions
+      if (name !== 'browser_action' && this._lastToolType === 'browser_action') {
         this.blurOverlayFn();
         await new Promise((r) => setTimeout(r, 200));
       }
@@ -489,10 +420,6 @@ class Agent {
       switch (name) {
         case 'browser_action':
           return await this._execBrowserAction(input);
-        case 'native_action':
-          return await this._execNativeAction(input);
-        case 'take_screenshot':
-          return await this._execScreenshot();
         case 'request_confirmation':
           return await this._execConfirmation(input);
         default:
@@ -503,7 +430,162 @@ class Agent {
     }
   }
 
-  // --- browser_action ---
+  // =========================================================================
+  // Computer tool (Claude's native computer-use)
+  // =========================================================================
+
+  async _execComputerAction(input) {
+    const { action, coordinate, text, start_coordinate, delta_x, delta_y } = input;
+
+    switch (action) {
+      case 'screenshot': {
+        return await this._captureScreenshot();
+      }
+
+      case 'left_click': {
+        const [px, py] = this._scaleToPhysical(coordinate);
+        console.log(`[click] API(${coordinate[0]}, ${coordinate[1]}) → Physical(${px}, ${py})`);
+        this.blurOverlayFn();
+        await this.computer.leftClick(px, py);
+        await new Promise((r) => setTimeout(r, 100));
+        return await this._captureScreenshot();
+      }
+
+      case 'right_click': {
+        const [px, py] = this._scaleToPhysical(coordinate);
+        console.log(`[right_click] API(${coordinate[0]}, ${coordinate[1]}) → Physical(${px}, ${py})`);
+        this.blurOverlayFn();
+        await this.computer.rightClick(px, py);
+        await new Promise((r) => setTimeout(r, 100));
+        return await this._captureScreenshot();
+      }
+
+      case 'double_click': {
+        const [px, py] = this._scaleToPhysical(coordinate);
+        console.log(`[double_click] API(${coordinate[0]}, ${coordinate[1]}) → Physical(${px}, ${py})`);
+        this.blurOverlayFn();
+        await this.computer.doubleClick(px, py);
+        await new Promise((r) => setTimeout(r, 100));
+        return await this._captureScreenshot();
+      }
+
+      case 'middle_click': {
+        const [px, py] = this._scaleToPhysical(coordinate);
+        console.log(`[middle_click] API(${coordinate[0]}, ${coordinate[1]}) → Physical(${px}, ${py})`);
+        this.blurOverlayFn();
+        await this.computer.middleClick(px, py);
+        await new Promise((r) => setTimeout(r, 100));
+        return await this._captureScreenshot();
+      }
+
+      case 'type': {
+        console.log(`[type] "${(text || '').slice(0, 50)}${(text || '').length > 50 ? '...' : ''}"`);
+        await this.computer.type(text);
+        await new Promise((r) => setTimeout(r, 50));
+        return await this._captureScreenshot();
+      }
+
+      case 'key': {
+        const normalized = this._normalizeKey(text);
+        console.log(`[key] "${text}" → "${normalized}"`);
+        await this.computer.key(normalized);
+        await new Promise((r) => setTimeout(r, 100));
+        return await this._captureScreenshot();
+      }
+
+      case 'scroll': {
+        const [px, py] = coordinate ? this._scaleToPhysical(coordinate) : [
+          Math.round(this.displayConfig.physicalWidth / 2),
+          Math.round(this.displayConfig.physicalHeight / 2),
+        ];
+        const dir = (delta_y || 0) < 0 ? 'up' : 'down';
+        const amount = Math.max(1, Math.abs(delta_y || 3));
+        console.log(`[scroll] ${dir} ${amount} at Physical(${px}, ${py})`);
+        await this.computer.scroll(px, py, dir, amount);
+        await new Promise((r) => setTimeout(r, 100));
+        return await this._captureScreenshot();
+      }
+
+      case 'mouse_move': {
+        const [px, py] = this._scaleToPhysical(coordinate);
+        console.log(`[mouse_move] API(${coordinate[0]}, ${coordinate[1]}) → Physical(${px}, ${py})`);
+        await this.computer.mouseMove(px, py);
+        // No auto-screenshot for mouse_move
+        return [{ type: 'text', text: `Moved mouse to (${coordinate[0]}, ${coordinate[1]})` }];
+      }
+
+      case 'left_click_drag': {
+        const [sx, sy] = this._scaleToPhysical(start_coordinate);
+        const [ex, ey] = this._scaleToPhysical(coordinate);
+        console.log(`[drag] Physical(${sx}, ${sy}) → Physical(${ex}, ${ey})`);
+        this.blurOverlayFn();
+        await this.computer.leftClickDrag(sx, sy, ex, ey);
+        await new Promise((r) => setTimeout(r, 100));
+        return await this._captureScreenshot();
+      }
+
+      default:
+        return [{ type: 'text', text: `Unknown computer action: ${action}` }];
+    }
+  }
+
+  // =========================================================================
+  // Screenshot capture (downscaled by screenshotFn)
+  // =========================================================================
+
+  async _captureScreenshot() {
+    const ss = await this.screenshotFn();
+    if (!ss || !ss.ok) {
+      return [{ type: 'text', text: `Screenshot failed: ${ss?.error || 'unknown'}` }];
+    }
+
+    // Track screenshot hash for model upgrading on stale screens
+    const hash = crypto.createHash('md5').update(ss.data.slice(0, 5000)).digest('hex');
+    if (this._lastScreenshotHash === hash) {
+      this._retryCount++;
+      if (this._retryCount >= 3 && this._currentModel !== MODEL_ACCURATE) {
+        console.log('[agent] Screen unchanged after actions — upgrading to accurate model');
+        this._currentModel = MODEL_ACCURATE;
+      }
+    } else {
+      this._retryCount = 0;
+    }
+    this._lastScreenshotHash = hash;
+
+    return [{
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: ss.mediaType || 'image/jpeg',
+        data: ss.data,
+      },
+    }];
+  }
+
+  // =========================================================================
+  // Coordinate scaling
+  // =========================================================================
+
+  /** Convert API coordinates (display space) → physical screen coordinates */
+  _scaleToPhysical(coordinate) {
+    if (!coordinate || coordinate.length < 2) return [0, 0];
+    const px = Math.round(coordinate[0] * this.displayConfig.scaleX);
+    const py = Math.round(coordinate[1] * this.displayConfig.scaleY);
+    return [px, py];
+  }
+
+  /** Normalize Claude computer-use key names to our VK format */
+  _normalizeKey(keyText) {
+    if (!keyText) return '';
+    return keyText.split('+').map((part) => {
+      const trimmed = part.trim();
+      return KEY_NORMALIZE[trimmed] || trimmed.toLowerCase();
+    }).join('+');
+  }
+
+  // =========================================================================
+  // browser_action (CDP — kept for speed on web pages)
+  // =========================================================================
 
   async _execBrowserAction(input) {
     const { action } = input;
@@ -512,22 +594,13 @@ class Agent {
       return [{ type: 'text', text: 'Browser module not available.' }];
     }
 
-    // Auto-connect if needed — auto-launch Chrome with CDP if necessary
+    // Auto-connect if needed
     if (typeof this.browser.isConnected === 'function' && !this.browser.isConnected()) {
       if (typeof this.browser.autoConnectOrLaunchChrome === 'function') {
         this.onProgress({ type: 'status', text: 'Connecting to Chrome...' });
         const result = await this.browser.autoConnectOrLaunchChrome();
         if (!result.connected) {
-          // Try Electron app CDP if Chrome isn't available
-          if (this._activeElectronApp) {
-            const appCtx = await this.browser.getAppPageContext(this._activeElectronApp);
-            if (!appCtx) {
-              return [{ type: 'text', text: `No browser connection. ${result.message}` }];
-            }
-            // Route to Electron app page
-          } else {
-            return [{ type: 'text', text: result.message }];
-          }
+          return [{ type: 'text', text: result.message }];
         }
       }
     }
@@ -543,7 +616,7 @@ class Agent {
         const ctx = await this.browser.getPageContext();
         if (ctx) {
           const elemSummary = ctx.elements.slice(0, 20).map((e) =>
-            `${e.tag}${e.id ? '#'+e.id : ''} "${(e.text||'').slice(0,30)}"`
+            `${e.tag}${e.id ? '#' + e.id : ''} "${(e.text || '').slice(0, 30)}"`
           ).join('\n');
           return [{ type: 'text', text: `Navigated to ${input.url}\n"${ctx.title}"\n${elemSummary}` }];
         }
@@ -552,10 +625,10 @@ class Agent {
 
       case 'read_page': {
         const ctx = await this.browser.getPageContext();
-        if (!ctx) return [{ type: 'text', text: 'Could not read page — no active page found.' }];
+        if (!ctx) return [{ type: 'text', text: 'Could not read page.' }];
         const elemSummary = ctx.elements.slice(0, 30).map((e) => {
           const parts = [e.tag];
-          if (e.text) parts.push(`"${(e.text||'').slice(0,40)}"`);
+          if (e.text) parts.push(`"${(e.text || '').slice(0, 40)}"`);
           if (e.id) parts.push(`#${e.id}`);
           if (e.type) parts.push(`type=${e.type}`);
           return parts.join(' ');
@@ -607,240 +680,9 @@ class Agent {
     }
   }
 
-  // --- native_action ---
-
-  async _execNativeAction(input) {
-    const { action } = input;
-
-    if (!this.computer) {
-      return [{ type: 'text', text: 'Computer module not available.' }];
-    }
-
-    switch (action) {
-      case 'read_screen': {
-        const uiInfo = await this.computer.getUIElements();
-        if (!uiInfo || !uiInfo.elements || uiInfo.elements.length === 0) {
-          return [{ type: 'text', text: `Window: ${uiInfo ? uiInfo.window : 'unknown'}\nNo interactive elements found (source: ${uiInfo?.source || 'unknown'}).\nThis app may use custom rendering. Try take_screenshot for grid-based targeting, or use keyboard shortcuts.` }];
-        }
-        const source = uiInfo.source === 'uia' ? 'UIAutomation' : 'Win32 EnumChildWindows';
-        const rows = uiInfo.elements.map((e) =>
-          `  [${e.type}] "${e.name}" at (${e.x}, ${e.y}) ${e.w}x${e.h}${e.enabled === false ? ' [DISABLED]' : ''}`
-        );
-        return [{ type: 'text', text: `Window: ${uiInfo.window} (via ${source})\nInteractive elements (${uiInfo.elements.length}):\n${rows.join('\n')}\n\nUse target="element name" in click action to click by name (pixel-perfect). The (x,y) coordinates are element centers.` }];
-      }
-
-      case 'click': {
-        // Capture pre-click state for verification
-        const preClickTitle = this.computer.getForegroundWindowTitle();
-
-        // Priority 1: Grid cell label (from screenshot overlay)
-        if (input.cell && this._lastGridMap) {
-          const resolved = resolveCell(this._lastGridMap, input.cell);
-          if (resolved) {
-            await this.computer.leftClick(resolved.x, resolved.y);
-            await new Promise((r) => setTimeout(r, 100));
-            const postTitle = this.computer.getForegroundWindowTitle();
-            const changed = postTitle !== preClickTitle ? ` Window changed to: "${postTitle}"` : ` Window: "${postTitle}" (unchanged)`;
-            return [{ type: 'text', text: `Clicked grid cell ${input.cell} at (${resolved.x}, ${resolved.y}).${changed}` }];
-          }
-          return [{ type: 'text', text: `Grid cell "${input.cell}" not found. Valid cells: A1-L8. Take a new screenshot to get fresh grid.` }];
-        }
-
-        // Priority 2: Target name (UIAutomation element lookup) — before raw coords
-        if (input.target) {
-          const uiInfo = await this.computer.getUIElements();
-          const targetLower = input.target.toLowerCase();
-          // Try exact match first, then substring match
-          let match = (uiInfo.elements || []).find((e) =>
-            e.name && e.name.toLowerCase() === targetLower
-          );
-          if (!match) {
-            match = (uiInfo.elements || []).find((e) =>
-              e.name && e.name.toLowerCase().includes(targetLower)
-            );
-          }
-          if (match) {
-            await this.computer.leftClick(match.x, match.y);
-            await new Promise((r) => setTimeout(r, 100));
-            const postTitle = this.computer.getForegroundWindowTitle();
-            const changed = postTitle !== preClickTitle ? ` Window changed to: "${postTitle}"` : '';
-            return [{ type: 'text', text: `Clicked "${match.name}" [${match.type}] at (${match.x}, ${match.y}).${changed}` }];
-          }
-          const hint = this._lastGridMap
-            ? ' Take a screenshot and use grid cell labels for precise clicking.'
-            : ' Try take_screenshot to see the screen and use grid cell labels.';
-          return [{ type: 'text', text: `Could not find element matching "${input.target}".${hint} Available elements: ${(uiInfo.elements || []).slice(0, 10).map(e => `"${e.name}" (${e.type})`).join(', ') || 'none detected'}` }];
-        }
-
-        // Priority 3: Raw coordinates (last resort)
-        if (input.x !== undefined && input.y !== undefined) {
-          await this.computer.leftClick(input.x, input.y);
-          await new Promise((r) => setTimeout(r, 100));
-          const postTitle = this.computer.getForegroundWindowTitle();
-          const changed = postTitle !== preClickTitle ? ` Window changed to: "${postTitle}"` : ` Window: "${postTitle}" (unchanged)`;
-          return [{ type: 'text', text: `Clicked at (${input.x}, ${input.y}).${changed} NOTE: Raw coordinates are unreliable. Prefer target="name" or cell="F4" from grid.` }];
-        }
-
-        return [{ type: 'text', text: 'click requires cell (grid label), target (element name), or x/y coordinates.' }];
-      }
-
-      case 'type': {
-        const val = input.value || input.target || '';
-        if (!val) return [{ type: 'text', text: 'type requires a value.' }];
-        const preTypeTitle = this.computer.getForegroundWindowTitle();
-        await this.computer.type(val);
-        const postTypeTitle = this.computer.getForegroundWindowTitle();
-        const focusOk = preTypeTitle === postTypeTitle && postTypeTitle !== '';
-        return [{ type: 'text', text: `Typed "${val.slice(0, 50)}${val.length > 50 ? '...' : ''}" — active window: "${postTypeTitle}"${focusOk ? '' : ' WARNING: Window focus may have changed during typing. Text might have gone to wrong window. Take a screenshot to verify.'}` }];
-      }
-
-      case 'key': {
-        const keys = input.value || input.target || '';
-        if (!keys) return [{ type: 'text', text: 'key requires a value (e.g. "ctrl+c", "enter").' }];
-        const preKeyTitle = this.computer.getForegroundWindowTitle();
-        await this.computer.key(keys);
-        const postKeyTitle = this.computer.getForegroundWindowTitle();
-        return [{ type: 'text', text: `Pressed ${keys} — active window: "${postKeyTitle}"${postKeyTitle !== preKeyTitle ? ' (window changed)' : ''}` }];
-      }
-
-      case 'scroll': {
-        const x = input.x || 960;
-        const y = input.y || 540;
-        const dir = input.value || 'down';
-        await this.computer.scroll(x, y, dir, 3);
-        return [{ type: 'text', text: `Scrolled ${dir} at (${x}, ${y})` }];
-      }
-
-      case 'run_command': {
-        const cmd = input.command || input.value || '';
-        if (!cmd) return [{ type: 'text', text: 'run_command requires a command.' }];
-        const result = await this.computer.runCommand(cmd);
-        const parts = [];
-        if (result.stdout) parts.push(`stdout: ${result.stdout}`);
-        if (result.stderr) parts.push(`stderr: ${result.stderr}`);
-        if (result.error) parts.push(`error: ${result.error}`);
-        return [{ type: 'text', text: parts.join('\n') || (result.ok ? 'Command executed.' : 'Command failed.') }];
-      }
-
-      case 'focus_window': {
-        const pattern = input.target || input.value || '';
-        if (!pattern) return [{ type: 'text', text: 'focus_window requires a target window title pattern.' }];
-        // Blur overlay first so it doesn't hold foreground
-        this.blurOverlayFn();
-        await new Promise((r) => setTimeout(r, 100));
-        const result = await this.computer.focusWindow(pattern);
-        if (result.ok) {
-          // Extra wait for window to fully activate
-          await new Promise((r) => setTimeout(r, 100));
-
-          // Try CDP connection to the focused app
-          let cdpNote = '';
-          if (this.browser && typeof this.browser.detectCurrentApp === 'function') {
-            try {
-              const detected = await this.browser.detectCurrentApp();
-              if (detected.type === 'cdp' && detected.connection) {
-                this._activeElectronApp = detected.appName;
-                cdpNote = ` [CDP connected to ${detected.appName} — use browser_action for DOM access]`;
-              }
-            } catch { /* CDP connection optional */ }
-          }
-
-          return [{ type: 'text', text: `Focused: ${result.title} (${result.process})${cdpNote}` }];
-        }
-        return [{ type: 'text', text: result.error }];
-      }
-
-      case 'open_app': {
-        const appName = (input.target || input.value || '').toLowerCase().trim();
-        if (!appName) return [{ type: 'text', text: 'open_app requires a target app name.' }];
-
-        // First try focus_window — app might already be running
-        this.blurOverlayFn();
-        await new Promise((r) => setTimeout(r, 100));
-        const focusResult = await this.computer.focusWindow(appName);
-        if (focusResult.ok) {
-          await new Promise((r) => setTimeout(r, 200));
-          return [{ type: 'text', text: `${focusResult.title} is already open — brought to front.` }];
-        }
-
-        // Known app launch paths
-        const path = require('path');
-        const la = process.env.LOCALAPPDATA || '';
-        const APP_PATHS = {
-          discord: path.join(la, 'Discord', 'Update.exe'),
-          spotify: path.join(process.env.APPDATA || '', 'Spotify', 'Spotify.exe'),
-          slack: path.join(la, 'slack', 'slack.exe'),
-          notepad: 'notepad.exe',
-          explorer: 'explorer.exe',
-          chrome: require('./browser').getChromePath ? require('./browser').getChromePath() : 'chrome',
-        };
-
-        // Try known path
-        const knownPath = APP_PATHS[appName];
-        if (knownPath) {
-          const { spawn: sp } = require('child_process');
-          const args = appName === 'discord' ? ['--processStart', 'Discord.exe'] : [];
-          try {
-            const child = sp(knownPath, args, { detached: true, stdio: 'ignore', windowsHide: false });
-            child.unref();
-            child.on('error', () => {});
-          } catch {}
-          await new Promise((r) => setTimeout(r, 2000));
-          // Try to focus the newly opened app
-          const focus2 = await this.computer.focusWindow(appName);
-          return [{ type: 'text', text: focus2.ok ? `Opened ${appName}: ${focus2.title}` : `Launched ${appName} — waiting for it to start.` }];
-        }
-
-        // Fallback: try `start appname`
-        await this.computer.runCommand(`start ${appName}`);
-        await new Promise((r) => setTimeout(r, 1500));
-        const focus3 = await this.computer.focusWindow(appName);
-        return [{ type: 'text', text: focus3.ok ? `Opened ${appName}: ${focus3.title}` : `Tried to open ${appName}.` }];
-      }
-
-      default:
-        return [{ type: 'text', text: `Unknown native_action: ${action}` }];
-    }
-  }
-
-  // --- take_screenshot ---
-
-  async _execScreenshot() {
-    const ss = await this.screenshotFn();
-    if (ss && ss.ok) {
-      try {
-        // Physical pixel coordinates — screenshot pixels = cursor pixels (1:1)
-        const gridResult = overlayGrid(Buffer.from(ss.data, 'base64'));
-        this._lastGridMap = gridResult.gridMap;
-
-        return [
-          {
-            type: 'image',
-            source: {
-              type: 'base64',
-              media_type: gridResult.mediaType,
-              data: gridResult.annotatedBase64,
-            },
-          },
-          {
-            type: 'text',
-            text: 'Screenshot with grid overlay. Grid cells: columns A-L (left to right), rows 1-8 (top to bottom). Use cell="F4" in native_action click to click the center of cell F4. For sub-cell precision, append -TL, -TR, -BL, -BR (e.g. cell="F4-TL" for top-left quarter).',
-          },
-        ];
-      } catch (gridErr) {
-        console.error('[agent] Grid overlay error, returning raw screenshot:', gridErr.message);
-        // Fallback to raw screenshot without grid
-        this._lastGridMap = null;
-        return [
-          { type: 'image', source: { type: 'base64', media_type: ss.mediaType || 'image/png', data: ss.data } },
-          { type: 'text', text: 'Screenshot (grid overlay failed — use read_screen for element positions instead).' },
-        ];
-      }
-    }
-    return [{ type: 'text', text: 'Screenshot failed: ' + (ss ? ss.error : 'unknown') }];
-  }
-
-  // --- request_confirmation ---
+  // =========================================================================
+  // request_confirmation
+  // =========================================================================
 
   async _execConfirmation(input) {
     this.onProgress({ type: 'status', text: 'Waiting for your confirmation...' });
@@ -859,18 +701,19 @@ class Agent {
   }
 
   // =========================================================================
-  // API call
+  // API call (beta — computer-use)
   // =========================================================================
 
   _callAPI() {
     this._validateHistory();
 
-    return this.client.messages.create({
-      model: MODEL,
+    return this.client.beta.messages.create({
+      model: this._currentModel,
       max_tokens: MAX_TOKENS,
       system: SYSTEM_PROMPT,
-      tools,
+      tools: this._getTools(),
       messages: this.history,
+      betas: ['computer-use-2025-01-24'],
     });
   }
 
@@ -880,7 +723,7 @@ class Agent {
       if (msg.role === 'user' && Array.isArray(msg.content) &&
         msg.content.some((c) => c.type === 'tool_result')) {
         if (i === 0 || this.history[i - 1].role !== 'assistant') {
-          console.error('[agent] Corrupted history detected — orphaned tool_result at index', i, '. Clearing history.');
+          console.error('[agent] Corrupted history — orphaned tool_result at index', i, '. Clearing.');
           this.history = [];
           return;
         }
@@ -888,7 +731,7 @@ class Agent {
         const toolUseIds = new Set(prevContent.filter((b) => b.type === 'tool_use').map((b) => b.id));
         const hasOrphan = msg.content.some((c) => c.type === 'tool_result' && !toolUseIds.has(c.tool_use_id));
         if (hasOrphan) {
-          console.error('[agent] Corrupted history — mismatched tool_use_id at index', i, '. Clearing history.');
+          console.error('[agent] Corrupted history — mismatched tool_use_id at index', i, '. Clearing.');
           this.history = [];
           return;
         }
@@ -921,8 +764,21 @@ class Agent {
 
   _toolLabel(tu) {
     switch (tu.name) {
+      case 'computer': {
+        const a = tu.input?.action || '?';
+        if (a === 'screenshot') return 'Taking screenshot...';
+        if (a === 'left_click') return `Clicking (${tu.input.coordinate?.join(', ')})...`;
+        if (a === 'right_click') return `Right-clicking (${tu.input.coordinate?.join(', ')})...`;
+        if (a === 'double_click') return `Double-clicking (${tu.input.coordinate?.join(', ')})...`;
+        if (a === 'type') return `Typing "${(tu.input.text || '').slice(0, 30)}"...`;
+        if (a === 'key') return `Pressing ${tu.input.text || '?'}...`;
+        if (a === 'scroll') return 'Scrolling...';
+        if (a === 'mouse_move') return 'Moving mouse...';
+        if (a === 'left_click_drag') return 'Dragging...';
+        return `Computer: ${a}...`;
+      }
       case 'browser_action': {
-        const a = tu.input.action || '?';
+        const a = tu.input?.action || '?';
         if (a === 'navigate') return `Navigating to ${(tu.input.url || '').slice(0, 40)}...`;
         if (a === 'read_page') return 'Reading page...';
         if (a === 'click_selector') return `Clicking ${(tu.input.selector || '').slice(0, 30)}...`;
@@ -932,19 +788,6 @@ class Agent {
         if (a === 'press_key') return `Pressing ${tu.input.key || '?'}...`;
         return `Browser: ${a}...`;
       }
-      case 'native_action': {
-        const a = tu.input.action || '?';
-        if (a === 'read_screen') return 'Reading screen elements...';
-        if (a === 'click') return `Clicking ${tu.input.target || `(${tu.input.x}, ${tu.input.y})`}...`;
-        if (a === 'type') return `Typing "${(tu.input.value || '').slice(0, 30)}"...`;
-        if (a === 'key') return `Pressing ${tu.input.value || '?'}...`;
-        if (a === 'scroll') return `Scrolling ${tu.input.value || 'down'}...`;
-        if (a === 'run_command') return `Running: ${(tu.input.command || '').slice(0, 40)}...`;
-        if (a === 'focus_window') return `Focusing ${tu.input.target || tu.input.value || '?'}...`;
-        return `Native: ${a}...`;
-      }
-      case 'take_screenshot':
-        return 'Taking screenshot...';
       case 'request_confirmation':
         return 'Asking for confirmation...';
       default:
@@ -955,6 +798,9 @@ class Agent {
   clearHistory() {
     this.history = [];
     this.toolCallHistory = [];
+    this._currentModel = MODEL_FAST;
+    this._retryCount = 0;
+    this._lastScreenshotHash = null;
   }
 
   _detectAppFromText(text) {

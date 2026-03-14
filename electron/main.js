@@ -14,12 +14,14 @@ const { menubar } = require('menubar');
 const Agent = require('../src/agent');
 const Computer = require('../src/computer');
 const browser = require('../src/browser');
-const { loadCalibration, runCalibration, validateCalibration } = require('../src/calibration');
+
+// Target long edge for downscaled screenshots (Anthropic recommends 1024x768 max)
+const TARGET_LONG_EDGE = 1024;
 
 let mb = null;
 let agent = null;
 let computer = null;
-let calibration = null;
+let displayConfig = null;
 let isQuitting = false;
 
 // Single instance lock
@@ -58,26 +60,59 @@ function sendToRenderer(channel, data) {
   }
 }
 
-// --- Screenshot (Tier 3 fallback) ---
+// ---------------------------------------------------------------------------
+// Display config — compute once at startup
+// ---------------------------------------------------------------------------
+
+function computeDisplayConfig() {
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const { width, height } = primaryDisplay.size;
+  const scaleFactor = primaryDisplay.scaleFactor || 1;
+
+  const physicalWidth = Math.round(width * scaleFactor);
+  const physicalHeight = Math.round(height * scaleFactor);
+
+  // Downscale: fit within TARGET_LONG_EDGE maintaining aspect ratio
+  const longEdge = Math.max(physicalWidth, physicalHeight);
+  const downscale = TARGET_LONG_EDGE / longEdge;
+  const displayWidth = Math.round(physicalWidth * downscale);
+  const displayHeight = Math.round(physicalHeight * downscale);
+
+  // Scale factors: API coords → physical coords
+  const scaleX = physicalWidth / displayWidth;
+  const scaleY = physicalHeight / displayHeight;
+
+  return { physicalWidth, physicalHeight, displayWidth, displayHeight, scaleX, scaleY };
+}
+
+// ---------------------------------------------------------------------------
+// Screenshot — capture and downscale for computer-use API
+// ---------------------------------------------------------------------------
 
 async function captureScreen() {
   try {
-    const primaryDisplay = screen.getPrimaryDisplay();
-    const { width, height } = primaryDisplay.size;
-    const scaleFactor = primaryDisplay.scaleFactor || 1;
+    if (!displayConfig) {
+      displayConfig = computeDisplayConfig();
+    }
+
+    // Capture at full physical resolution
     const sources = await desktopCapturer.getSources({
       types: ['screen'],
-      thumbnailSize: { width: Math.round(width * scaleFactor), height: Math.round(height * scaleFactor) },
+      thumbnailSize: { width: displayConfig.physicalWidth, height: displayConfig.physicalHeight },
     });
     if (sources.length === 0) return { ok: false, error: 'No screen sources' };
-    const jpeg = sources[0].thumbnail.toJPEG(50);
+
+    // Downscale to target display dimensions
+    const resized = sources[0].thumbnail.resize({
+      width: displayConfig.displayWidth,
+      height: displayConfig.displayHeight,
+    });
+    const jpeg = resized.toJPEG(50);
+
     return {
       ok: true,
       data: jpeg.toString('base64'),
       mediaType: 'image/jpeg',
-      scaleFactor,
-      logicalWidth: width,
-      logicalHeight: height,
     };
   } catch (err) {
     return { ok: false, error: err.message };
@@ -208,23 +243,11 @@ app.whenReady().then(async () => {
     computer = new Computer();
     console.log('[startup] Computer control ready');
 
-    // Screen calibration — verify physical cursor positioning
-    try {
-      const primaryDisplay = screen.getPrimaryDisplay();
-      calibration = loadCalibration();
-      calibration = validateCalibration(calibration, primaryDisplay);
-      if (!calibration) {
-        console.log('[startup] Running physical coordinate verification...');
-        calibration = await runCalibration({ screenshotFn: captureScreen });
-        console.log(`[startup] Calibration done: ${calibration.screenshot_width}x${calibration.screenshot_height} physical pixels, max error ${calibration.accuracy.max_error_px}px`);
-      } else {
-        console.log(`[startup] Loaded calibration: ${calibration.screenshot_width}x${calibration.screenshot_height} physical pixels`);
-      }
-    } catch (err) {
-      console.warn('[startup] Calibration failed (continuing without):', err.message);
-    }
+    // Compute display config for computer-use coordinate scaling
+    displayConfig = computeDisplayConfig();
+    console.log(`[startup] Display: ${displayConfig.displayWidth}x${displayConfig.displayHeight} (physical ${displayConfig.physicalWidth}x${displayConfig.physicalHeight}, scale ${displayConfig.scaleX.toFixed(2)}x)`);
 
-    // Try CDP connect to Chrome — auto-launch if not running with debug port
+    // Try CDP connect to Chrome
     let cdpResult = { connected: false, message: 'Skipped' };
     try {
       cdpResult = await browser.autoConnectOrLaunchChrome();
@@ -233,11 +256,12 @@ app.whenReady().then(async () => {
     }
     console.log(`[startup] Chrome CDP: ${cdpResult.message}`);
 
-    // Init agent
+    // Init agent with computer-use display config
     agent = new Agent({
       browser,
       computer,
       screenshotFn: captureScreen,
+      displayConfig,
       blurOverlayFn: () => {
         if (mb.window && !mb.window.isDestroyed()) {
           mb.window.blur();
@@ -253,12 +277,11 @@ app.whenReady().then(async () => {
       },
     });
 
-    console.log('[startup] Agent ready — hey, ready when you are');
+    console.log('[startup] Agent ready (computer-use API) — hey, ready when you are');
 
     // Register hotkey: Ctrl+Shift+Space activates voice
     globalShortcut.register('Ctrl+Shift+Space', () => {
       sendToRenderer('start-listening');
-      // Panel auto-opens when response arrives
     });
   });
 
