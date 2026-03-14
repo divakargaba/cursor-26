@@ -1,0 +1,22 @@
+{
+  "name": "ai-assistant",
+  "version": "0.1.0",
+  "description": "Voice-first AI copilot overlay powered by Claude",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "dotenv": "^16.4.5",
+    "koffi": "^2.15.2",
+    "menubar": "^9.5.2",
+    "node-fetch": "^3.3.2",
+    "playwright": "^1.58.2",
+    "ws": "^8.16.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "electron": "^29.1.0"
+  }
+}
