@@ -1,5 +1,25 @@
 require('dotenv').config();
 
+// ---------------------------------------------------------------------------
+// Guard against EPIPE errors on stdout/stderr.
+// When the Electron app outlives the terminal that spawned it, the stdio
+// pipe closes and every console.log throws an uncaught EPIPE exception.
+// ---------------------------------------------------------------------------
+for (const stream of [process.stdout, process.stderr]) {
+  if (stream && typeof stream.on === 'function') {
+    stream.on('error', (err) => {
+      if (err.code === 'EPIPE' || err.message?.includes('EPIPE')) return; // swallow
+      throw err; // re-throw non-EPIPE errors
+    });
+  }
+}
+
+process.on('uncaughtException', (err) => {
+  if (err.code === 'EPIPE' || err.message?.includes('EPIPE')) return; // swallow
+  console.error('[main] Uncaught exception:', err);
+  process.exit(1);
+});
+
 const {
   app,
   BrowserWindow,
@@ -15,6 +35,10 @@ const Agent = require('../src/agent');
 const Computer = require('../src/computer');
 const browser = require('../src/browser');
 const { loadCalibration, runCalibration, validateCalibration } = require('../src/calibration');
+
+const ORB_WINDOW_SIZE = 200;
+const PANEL_WIDTH = 360;
+const PANEL_HEIGHT = 480;
 
 let mb = null;
 let agent = null;
@@ -231,6 +255,23 @@ ipcMain.handle('capture-screenshot', async () => {
   return await captureScreen();
 });
 
+// Two-stage panel: expand from orb to full panel
+ipcMain.on('expand-panel', () => {
+  if (!mb || !mb.window || mb.window.isDestroyed()) return;
+  const bounds = mb.window.getBounds();
+  const cx = bounds.x + Math.round(bounds.width / 2);
+  const newX = Math.round(cx - PANEL_WIDTH / 2);
+  mb.window.setBounds({ x: newX, y: bounds.y, width: PANEL_WIDTH, height: PANEL_HEIGHT });
+});
+
+ipcMain.on('collapse-panel', () => {
+  if (!mb || !mb.window || mb.window.isDestroyed()) return;
+  const bounds = mb.window.getBounds();
+  const cx = bounds.x + Math.round(bounds.width / 2);
+  const newX = Math.round(cx - ORB_WINDOW_SIZE / 2);
+  mb.window.setBounds({ x: newX, y: bounds.y, width: ORB_WINDOW_SIZE, height: ORB_WINDOW_SIZE });
+});
+
 // Whisper API fallback for voice transcription
 ipcMain.handle('transcribe-audio', async (_event, { audioBase64 }) => {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -274,11 +315,13 @@ app.whenReady().then(async () => {
     preloadWindow: true,
     showDockIcon: false,
     browserWindow: {
-      width: 380,
-      height: 560,
+      width: ORB_WINDOW_SIZE,
+      height: ORB_WINDOW_SIZE,
       resizable: false,
       frame: false,
       transparent: true,
+      hasShadow: false,
+      backgroundColor: '#00000000',
       alwaysOnTop: false,
       skipTaskbar: true,
       webPreferences: {
@@ -362,9 +405,19 @@ app.whenReady().then(async () => {
     });
   });
 
-  // Emit focus-lost when panel loses focus
+  // On hide: reset to orb mode and collapse window
   mb.on('hide', () => {
     sendToRenderer('focus-lost');
+    sendToRenderer('panel-reset');
+    // Collapse window back to orb size
+    if (mb.window && !mb.window.isDestroyed()) {
+      const bounds = mb.window.getBounds();
+      if (bounds.width !== ORB_WINDOW_SIZE || bounds.height !== ORB_WINDOW_SIZE) {
+        const cx = bounds.x + Math.round(bounds.width / 2);
+        const newX = Math.round(cx - ORB_WINDOW_SIZE / 2);
+        mb.window.setBounds({ x: newX, y: bounds.y, width: ORB_WINDOW_SIZE, height: ORB_WINDOW_SIZE });
+      }
+    }
   });
 });
 

@@ -31,6 +31,12 @@ contextBridge.exposeInMainWorld('aiAssistant', {
   transcribeAudio: (audioBase64) =>
     ipcRenderer.invoke('transcribe-audio', { audioBase64 }),
 
+  expandPanel: () =>
+    ipcRenderer.send('expand-panel'),
+
+  collapsePanel: () =>
+    ipcRenderer.send('collapse-panel'),
+
   onAgentProgress: (callback) => {
     ipcRenderer.on('agent-progress', (_event, data) => callback(data));
   },
@@ -49,5 +55,9 @@ contextBridge.exposeInMainWorld('aiAssistant', {
 
   onFocusLost: (callback) => {
     ipcRenderer.on('focus-lost', () => callback());
+  },
+
+  onPanelReset: (callback) => {
+    ipcRenderer.on('panel-reset', () => callback());
   },
 });

@@ -233,16 +233,65 @@ function _isChromeRunning() {
   });
 }
 
-// _getChromeUserDataDir removed — no longer launching Chrome.
-
-// _launchChrome and _getDebugProfileDir removed — the assistant must never
-// launch, kill, or replace the user's Chrome. Connect-only.
+/**
+ * Get the debug profile directory for Chrome CDP.
+ * Chrome 136+ requires --user-data-dir to be a NON-default path for
+ * --remote-debugging-port to take effect.
+ */
+function _getDebugUserDataDir() {
+  if (IS_MAC) {
+    return path.join(process.env.HOME || '/tmp', 'Library', 'Application Support', 'Google', 'ChromeDebug');
+  } else if (IS_WIN) {
+    return path.join(process.env.LOCALAPPDATA || 'C:\\Users\\Public', 'Google', 'ChromeDebug');
+  }
+  return path.join(process.env.HOME || '/tmp', '.config', 'google-chrome-debug');
+}
 
 /**
- * Try to connect to the user's existing Chrome on port 9222.
- * NEVER launches Chrome, NEVER kills Chrome, NEVER opens a second instance.
- * If Chrome isn't running or doesn't have --remote-debugging-port=9222, returns
- * a clear message telling the user how to restart Chrome with the flag.
+ * Launch Chrome with CDP enabled.
+ * Uses a dedicated debug profile directory (required by Chrome 136+).
+ */
+function _launchChromeWithCDP() {
+  const debugDir = _getDebugUserDataDir();
+  const port = 9222;
+
+  if (IS_MAC) {
+    const chromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+    spawn(chromePath, [
+      `--remote-debugging-port=${port}`,
+      `--user-data-dir=${debugDir}`,
+    ], { detached: true, stdio: 'ignore' }).unref();
+  } else if (IS_WIN) {
+    // Try common Chrome locations on Windows
+    const possiblePaths = [
+      path.join(process.env['PROGRAMFILES'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(process.env['PROGRAMFILES(X86)'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    ];
+    const chromePath = possiblePaths.find((p) => fs.existsSync(p));
+    if (!chromePath) {
+      console.log('[browser] Could not find Chrome installation on Windows');
+      return false;
+    }
+    spawn(chromePath, [
+      `--remote-debugging-port=${port}`,
+      `--user-data-dir=${debugDir}`,
+    ], { detached: true, stdio: 'ignore', windowsHide: false }).unref();
+  } else {
+    spawn('google-chrome', [
+      `--remote-debugging-port=${port}`,
+      `--user-data-dir=${debugDir}`,
+    ], { detached: true, stdio: 'ignore' }).unref();
+  }
+
+  console.log(`[browser] Launched Chrome with CDP on port ${port} (profile: ${debugDir})`);
+  return true;
+}
+
+/**
+ * Try to connect to Chrome's CDP on port 9222.
+ * If Chrome isn't running with CDP, launches it automatically with the
+ * correct flags (including --user-data-dir required by Chrome 136+).
  */
 async function autoConnectOrLaunchChrome() {
   // Try existing CDP on port 9222
@@ -251,19 +300,27 @@ async function autoConnectOrLaunchChrome() {
     return { connected: true, message: 'Connected to existing Chrome CDP' };
   }
 
-  // Connection failed — figure out why and give user a clear message
-  const isRunning = await _isChromeRunning();
-
-  const restartCmd = IS_MAC
-    ? 'open -na "Google Chrome" --args --remote-debugging-port=9222'
-    : 'chrome --remote-debugging-port=9222';
-
-  if (!isRunning) {
-    _lastCDPFailReason = `Chrome is not running. Start it with: ${restartCmd}`;
-  } else {
-    _lastCDPFailReason = `Chrome is running but without --remote-debugging-port=9222. To fix: quit Chrome (${IS_MAC ? 'Cmd+Q' : 'close all windows'}), then run: ${restartCmd} — your tabs will reopen and the assistant will connect to that same Chrome.`;
+  // CDP not available — launch Chrome with debugging enabled
+  console.log('[browser] CDP not available, launching Chrome with debugging enabled...');
+  const launched = _launchChromeWithCDP();
+  if (!launched) {
+    _lastCDPFailReason = 'Could not find or launch Chrome';
+    return { connected: false, message: _lastCDPFailReason };
   }
 
+  // Wait for Chrome to start and CDP to become available
+  for (let i = 0; i < 10; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const alive = await _isCDPAlive(9222);
+    if (alive) {
+      const ok = await connectToChrome();
+      if (ok) {
+        return { connected: true, message: 'Launched Chrome and connected via CDP' };
+      }
+    }
+  }
+
+  _lastCDPFailReason = 'Launched Chrome but CDP did not become available within 10s';
   console.log(`[browser] ${_lastCDPFailReason}`);
   return { connected: false, message: _lastCDPFailReason };
 }

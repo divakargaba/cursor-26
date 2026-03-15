@@ -47,7 +47,13 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:www.hyperwriteai.com)",
       "WebFetch(domain:o-mega.ai)",
-      "WebFetch(domain:api.github.com)"
+      "WebFetch(domain:api.github.com)",
+      "Bash(pgrep:*)",
+      "Bash(kill:*)",
+      "Bash(pkill:*)",
+      "Bash(lsof:*)",
+      "Bash(open:*)",
+      "Bash(osascript:*)"
     ]
   }
 }
