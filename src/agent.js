@@ -28,7 +28,7 @@ const KEY_NORMALIZE = {
   'Escape': 'escape', 'space': 'space', 'Delete': 'delete',
   'Home': 'home', 'End': 'end', 'Page_Up': 'pageup', 'Page_Down': 'pagedown',
   'Up': 'up', 'Down': 'down', 'Left': 'left', 'Right': 'right',
-  'Super_L': 'win', 'Super_R': 'win', 'Super': 'win',
+  'Super_L': 'win', 'Super_R': 'win', 'Super': 'win', 'super': 'win',
   'Control_L': 'ctrl', 'Control_R': 'ctrl', 'Control': 'ctrl',
   'Alt_L': 'alt', 'Alt_R': 'alt',
   'Shift_L': 'shift', 'Shift_R': 'shift',
@@ -169,6 +169,7 @@ class Agent {
 
     // Passive mode: busy flag
     this._runLoopActive = false;
+    this._aborted = false;
 
     // Track last focused window for auto-refocus before computer actions
     this._lastFocusedWindow = null;
@@ -336,6 +337,7 @@ class Agent {
 
     this._currentActions = [];
     this._chatStartTime = Date.now();
+    this._aborted = false;
     this._lastFailedTool = null;
 
     // Training mode commands
@@ -413,6 +415,7 @@ class Agent {
     const spokenTexts = []; // Track text already emitted mid-loop to avoid duplicate speech
 
     while (true) {
+      if (this._aborted) return { text: '' };
       iterations++;
       console.log(`[agent] --- Iteration ${iterations} (model: ${this._currentModel}) ---`);
       console.time(`[agent] iteration-${iterations}`);
@@ -454,6 +457,7 @@ class Agent {
       let halted = false;
 
       for (let i = 0; i < toolUses.length; i++) {
+        if (this._aborted) return { text: '' };
         const tu = toolUses[i];
 
         // Inter-action delay
@@ -1119,6 +1123,14 @@ class Agent {
     }
   }
 
+  abort() {
+    this._aborted = true;
+    this._runLoopActive = false;
+    this.history = [];
+    this.toolCallHistory = [];
+    console.log('[agent] Aborted by user');
+  }
+
   clearHistory() {
     this.history = [];
     this.toolCallHistory = [];
@@ -1126,7 +1138,7 @@ class Agent {
     this._retryCount = 0;
     this._lastScreenshotHash = null;
     this._lastFailedTool = null;
-    // Don't reset training mode on clear -- keep it active across history clears
+    this._aborted = false;
   }
 
   // =========================================================================

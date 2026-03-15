@@ -99,7 +99,7 @@ const IsWindowEnabled = user32.func('bool __stdcall IsWindowEnabled(void *hWnd)'
 // ---------------------------------------------------------------------------
 
 const VK = {
-  ctrl: 0x11, control: 0x11, alt: 0x12, shift: 0x10, win: 0x5B,
+  ctrl: 0x11, control: 0x11, alt: 0x12, shift: 0x10, win: 0x5B, super: 0x5B,
   enter: 0x0D, return: 0x0D, tab: 0x09, escape: 0x1B, esc: 0x1B,
   backspace: 0x08, delete: 0x2E, space: 0x20,
   up: 0x26, down: 0x28, left: 0x25, right: 0x27,

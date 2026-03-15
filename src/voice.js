@@ -207,11 +207,13 @@ class VoiceInput {
 // =============================================================================
 
 class AlwaysOnListener {
-  constructor({ onWakeWord, onActiveStart, onActiveEnd, onError } = {}) {
+  constructor({ onWakeWord, onActiveStart, onActiveEnd, onError, onDeactivate, onAbort } = {}) {
     this.onWakeWord = onWakeWord || (() => {});
     this.onActiveStart = onActiveStart || (() => {});
     this.onActiveEnd = onActiveEnd || (() => {});
     this.onError = onError || (() => {});
+    this.onDeactivate = onDeactivate || (() => {});
+    this.onAbort = onAbort || (() => {});
 
     this.enabled = false;
     this._processingCommand = false;
@@ -244,9 +246,8 @@ class AlwaysOnListener {
       return;
     }
 
-    // Set up VAD (voice activity detection) via Web Audio API
+    // Set up AudioContext for silence detection during recording
     this._audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    // Force resume — Chromium suspends AudioContext when window is inactive
     if (this._audioContext.state === 'suspended') {
       await this._audioContext.resume();
     }
@@ -255,7 +256,24 @@ class AlwaysOnListener {
     this._analyser.fftSize = 512;
     source.connect(this._analyser);
 
-    console.log(`[always-on] Wake word listener active (Whisper + VAD, AudioContext: ${this._audioContext.state})`);
+    // Keepalive: force-resume AudioContext every 2s (Chromium suspends on inactive windows)
+    this._keepaliveInterval = setInterval(() => {
+      if (this._audioContext && this._audioContext.state === 'suspended') {
+        this._audioContext.resume();
+      }
+    }, 2000);
+
+    // Also resume immediately on state change
+    this._audioContext.onstatechange = () => {
+      if (this._audioContext && this._audioContext.state === 'suspended') {
+        this._audioContext.resume();
+      }
+    };
+
+    // Expose for main process keepalive
+    window._alwaysOnAudioCtx = this._audioContext;
+
+    console.log(`[always-on] Wake word listener active (Whisper, AudioContext: ${this._audioContext.state})`);
     this._whisperCycle();
   }
 
@@ -296,6 +314,8 @@ class AlwaysOnListener {
           console.log(`[always-on] Heard: "${transcript}"`);
           this._checkWakeWord(transcript, true);
         }
+      } else if (!result.ok) {
+        console.log(`[always-on] Whisper error: ${result.error}`);
       }
     } catch (e) {
       console.log('[always-on] Transcribe error:', e.message);
@@ -419,12 +439,32 @@ class AlwaysOnListener {
   // =========================================================================
 
   _checkWakeWord(transcript, isFinal) {
-    if (this._processingCommand) return;
     const lower = transcript.toLowerCase();
     const wakeIdx = lower.indexOf('jarvis');
     if (wakeIdx === -1) return;
 
     const afterWake = transcript.slice(wakeIdx + 6).replace(/^[,.\s]+/, '').trim();
+    const afterLower = afterWake.toLowerCase();
+
+    // Abort commands always get through, even mid-execution
+    const abortPatterns = /^(stop|cancel|abort|never\s?mind|hold on|wait)$/i;
+    if (isFinal && abortPatterns.test(afterLower)) {
+      console.log('[always-on] Abort command detected');
+      this._processingCommand = false;
+      this.onAbort();
+      return;
+    }
+
+    // Deactivation commands always get through
+    const deactivatePatterns = /^(deactivate|stop listening|go to sleep|shut down|goodbye|good night|sleep)$/i;
+    if (isFinal && deactivatePatterns.test(afterLower)) {
+      console.log('[always-on] Deactivation command detected');
+      this._processingCommand = false;
+      this.onDeactivate();
+      return;
+    }
+
+    if (this._processingCommand) return;
 
     if (isFinal) {
       this._processingCommand = true;
@@ -453,15 +493,21 @@ class AlwaysOnListener {
 
   stop() {
     this.enabled = false;
+    if (this._keepaliveInterval) {
+      clearInterval(this._keepaliveInterval);
+      this._keepaliveInterval = null;
+    }
     if (this._whisperStream) {
       this._whisperStream.getTracks().forEach(t => t.stop());
       this._whisperStream = null;
     }
     if (this._audioContext) {
+      this._audioContext.onstatechange = null;
       this._audioContext.close().catch(() => {});
       this._audioContext = null;
       this._analyser = null;
     }
+    window._alwaysOnAudioCtx = null;
     console.log('[always-on] Wake word listener stopped');
   }
 

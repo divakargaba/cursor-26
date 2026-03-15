@@ -324,6 +324,10 @@ ipcMain.on('tts-state', (_event, speaking) => {
   if (passiveMonitor) passiveMonitor.delivery.setTTSSpeaking(speaking);
 });
 
+ipcMain.on('abort-agent', () => {
+  if (agent) agent.abort();
+});
+
 ipcMain.on('toggle-passive-mode', () => {
   if (!passiveMonitor) return;
   if (passiveMonitor.isActive()) {
@@ -484,8 +488,17 @@ app.whenReady().then(async () => {
     // Release focus after mic initializes
     setTimeout(() => {
       if (mb.window && !mb.window.isDestroyed()) mb.window.blur();
-    }, 1500);
+    }, 2000);
     console.log('[startup] Orb visible');
+
+    // Keepalive: force-resume AudioContext from main process every 3s
+    setInterval(() => {
+      if (mb.window && !mb.window.isDestroyed()) {
+        mb.window.webContents.executeJavaScript(
+          'if(window._alwaysOnAudioCtx&&window._alwaysOnAudioCtx.state==="suspended")window._alwaysOnAudioCtx.resume()'
+        ).catch(() => {});
+      }
+    }, 3000);
   });
 
   // On hide: collapse to orb but keep visible — orb must NEVER vanish

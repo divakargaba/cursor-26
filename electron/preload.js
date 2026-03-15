@@ -71,6 +71,9 @@ contextBridge.exposeInMainWorld('aiAssistant', {
   togglePassiveMode: () =>
     ipcRenderer.send('toggle-passive-mode'),
 
+  abortAgent: () =>
+    ipcRenderer.send('abort-agent'),
+
   onPassiveNudge: (callback) => {
     ipcRenderer.on('passive-nudge', (_event, data) => callback(data));
   },

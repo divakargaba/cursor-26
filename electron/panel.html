@@ -122,6 +122,7 @@
   #status-dot.thinking { background:var(--accent-blue); animation:sPulse 1.5s ease-in-out infinite; }
   #status-dot.speaking { background:var(--accent-green); animation:sScale 1s ease-in-out infinite; }
   #status-dot.error { background:var(--accent-red); }
+  #status-dot.alert { background:var(--accent-amber); animation:sScale 1.5s ease-in-out infinite; }
   @keyframes sPulse { 0%,100%{opacity:1}50%{opacity:0.5} }
   @keyframes sScale { 0%,100%{transform:scale(1)}50%{transform:scale(1.25)} }
   #status-label {
@@ -568,6 +569,7 @@ const orbStateConfigs = {
   thinking:  { c1:[0.36,0.55,0.93], c2:[0.31,0.8,0.77], c3:[0.4,0.5,0.85], fresnel:[0.5,0.8,1.0], glow:0.14, noiseAmp:0.08, noiseSpeed:0.55, glowColor:'rgba(91,141,238,0.10)' },
   speaking:  { c1:[0.2,0.82,0.6], c2:[0.31,0.8,0.77], c3:[0.3,0.7,0.65], fresnel:[0.4,1.0,0.8], glow:0.16, noiseAmp:0.10, noiseSpeed:0.5, glowColor:'rgba(52,211,153,0.10)' },
   error:     { c1:[0.85,0.3,0.3], c2:[0.7,0.2,0.2], c3:[0.6,0.25,0.3], fresnel:[1.0,0.5,0.5], glow:0.06, noiseAmp:0.03, noiseSpeed:0.25, glowColor:'rgba(248,113,113,0.06)' },
+  alert:     { c1:[0.98,0.75,0.14], c2:[0.95,0.60,0.10], c3:[0.90,0.55,0.20], fresnel:[1.0,0.85,0.4], glow:0.20, noiseAmp:0.08, noiseSpeed:0.5, glowColor:'rgba(251,191,36,0.12)' },
 };
 
 const orbAnim = { scale:1.0 };
@@ -892,12 +894,20 @@ function setOrbState(state) {
   const s=state||'idle';
   statusDotEl.className='';statusLabelEl.className='';
   if(s!=='idle'){statusDotEl.classList.add(s);statusLabelEl.classList.add(s);}
-  const labels={idle:'Ready',listening:'Listening',thinking:'Thinking',speaking:'Speaking',error:'Error'};
+  const labels={idle:'Ready',listening:'Listening',thinking:'Thinking',speaking:'Speaking',error:'Error',alert:'Alert'};
   statusLabelEl.textContent=labels[s]||labels.idle;
   inputArea.classList.toggle('glow',s==='listening');
   setAmbientState(s);
   setOrbConfig(s);
   window.aiAssistant.setTrayState(s);
+}
+
+function stopSpeaking(){
+  if(window.speechSynthesis&&window.speechSynthesis.speaking){
+    window.speechSynthesis.cancel();
+    setOrbState('idle');
+    window.aiAssistant.reportTTSState(false);
+  }
 }
 
 function speak(text) {
@@ -1039,7 +1049,7 @@ const voice=new VoiceInput({
     else sendMessage(t);
   },
   onInterim:t=>{if(panelMode==='panel')showTyping(t);},
-  onStart:()=>{micBtn.classList.add('listening');setOrbState('listening');},
+  onStart:()=>{stopSpeaking();micBtn.classList.add('listening');setOrbState('listening');},
   onStop:()=>{micBtn.classList.remove('listening');},
   onError:m=>{if(panelMode==='panel')addMessage('assistant',m);setOrbState('idle');},
 });
@@ -1080,6 +1090,7 @@ const alwaysOn=new AlwaysOnListener({
     }
   },
   onActiveStart:()=>{
+    stopSpeaking(); // interrupt TTS when user starts talking
     setOrbState('listening');
   },
   onActiveEnd:()=>{
@@ -1088,6 +1099,22 @@ const alwaysOn=new AlwaysOnListener({
   onError:(msg)=>{
     console.log('[always-on] Error:',msg);
     aoBtn.classList.remove('active');
+  },
+  onDeactivate:()=>{
+    alwaysOn.stop();
+    aoBtn.classList.remove('active');
+    if(window.speechSynthesis) window.speechSynthesis.cancel();
+    speak('Going to sleep.');
+    setOrbState('idle');
+  },
+  onAbort:()=>{
+    window.aiAssistant.abortAgent();
+    stopSpeaking();
+    _voiceCommandBusy=false;
+    voiceOnlyMode=false;
+    hideTyping();
+    setOrbState('idle');
+    console.log('[voice] Agent aborted by user');
   },
 });
 
@@ -1139,14 +1166,14 @@ window.aiAssistant.onDomContextUpdate(data=>{
 // Passive mode: nudge toast
 let nudgeToastTimer=null;
 window.aiAssistant.onPassiveNudge(data=>{
-  // Show as toast + speak it
+  setOrbState('alert');
   showToast(data.text);
   speak(data.text);
-  // Show dismiss button via toast — clicking dismisses the category
   clearTimeout(nudgeToastTimer);
   nudgeToastTimer=setTimeout(()=>{
     window.aiAssistant.dismissNudge(data.category);
-  },15000); // auto-dismiss after 15s if not acted on
+    setOrbState('idle');
+  },15000);
 });
 
 if(window.speechSynthesis){window.speechSynthesis.getVoices();window.speechSynthesis.onvoiceschanged=()=>window.speechSynthesis.getVoices();}
