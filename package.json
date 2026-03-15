@@ -9,6 +9,8 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
+    "@picovoice/porcupine-node": "^4.0.2",
+    "@picovoice/web-voice-processor": "^4.0.9",
     "chrome-devtools-mcp": "^0.20.0",
     "dotenv": "^16.4.5",
     "koffi": "^2.15.2",
@@ -24,6 +26,8 @@
     "jest": "^30.3.0"
   },
   "jest": {
-    "roots": ["<rootDir>/tests"]
+    "roots": [
+      "<rootDir>/tests"
+    ]
   }
 }

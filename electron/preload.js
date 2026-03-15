@@ -60,4 +60,18 @@ contextBridge.exposeInMainWorld('aiAssistant', {
   onPanelReset: (callback) => {
     ipcRenderer.on('panel-reset', () => callback());
   },
+
+  // Passive mode (Mode 2)
+  dismissNudge: (category) =>
+    ipcRenderer.send('nudge-dismissed', category),
+
+  reportTTSState: (speaking) =>
+    ipcRenderer.send('tts-state', speaking),
+
+  togglePassiveMode: () =>
+    ipcRenderer.send('toggle-passive-mode'),
+
+  onPassiveNudge: (callback) => {
+    ipcRenderer.on('passive-nudge', (_event, data) => callback(data));
+  },
 });

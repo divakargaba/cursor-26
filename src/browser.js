@@ -234,9 +234,20 @@ function _isChromeRunning() {
 }
 
 /**
+ * Get the default Chrome user data directory path.
+ */
+function _getDefaultChromeUserDataDir() {
+  if (IS_MAC) {
+    return path.join(process.env.HOME || '/tmp', 'Library', 'Application Support', 'Google', 'Chrome');
+  } else if (IS_WIN) {
+    return path.join(process.env.LOCALAPPDATA || 'C:\\Users\\Public', 'Google', 'Chrome', 'User Data');
+  }
+  return path.join(process.env.HOME || '/tmp', '.config', 'google-chrome');
+}
+
+/**
  * Get the debug profile directory for Chrome CDP.
- * Chrome 136+ requires --user-data-dir to be a NON-default path for
- * --remote-debugging-port to take effect.
+ * Chrome 136+ requires --user-data-dir to be a NON-default path.
  */
 function _getDebugUserDataDir() {
   if (IS_MAC) {
@@ -248,10 +259,62 @@ function _getDebugUserDataDir() {
 }
 
 /**
+ * Sync cookies and login data from the real Chrome profile to the debug profile.
+ * This way the debug profile has all the user's sessions.
+ */
+function _syncProfileData() {
+  const src = _getDefaultChromeUserDataDir();
+  const dst = _getDebugUserDataDir();
+  const defaultProfile = path.join(src, 'Default');
+  const debugProfile = path.join(dst, 'Default');
+
+  try {
+    if (!fs.existsSync(defaultProfile)) return;
+    if (!fs.existsSync(debugProfile)) {
+      fs.mkdirSync(debugProfile, { recursive: true });
+    }
+
+    // Copy key files that hold cookies, logins, and session data
+    const filesToSync = [
+      'Cookies', 'Login Data', 'Web Data',
+      'Preferences', 'Secure Preferences',
+      'Local State',
+    ];
+
+    for (const file of filesToSync) {
+      const srcFile = path.join(defaultProfile, file);
+      const dstFile = path.join(debugProfile, file);
+      try {
+        if (fs.existsSync(srcFile)) {
+          fs.copyFileSync(srcFile, dstFile);
+        }
+      } catch { /* file locked or missing — skip */ }
+    }
+
+    // Also copy Local State to the root of debug dir
+    const localState = path.join(src, 'Local State');
+    const dstLocalState = path.join(dst, 'Local State');
+    try {
+      if (fs.existsSync(localState)) {
+        fs.copyFileSync(localState, dstLocalState);
+      }
+    } catch { /* skip */ }
+
+    console.log('[browser] Synced cookies/logins from default profile to debug profile');
+  } catch (err) {
+    console.log('[browser] Profile sync error (non-fatal):', err.message);
+  }
+}
+
+/**
  * Launch Chrome with CDP enabled.
- * Uses a dedicated debug profile directory (required by Chrome 136+).
+ * Uses a debug profile directory (Chrome 136+ requires non-default --user-data-dir).
+ * Syncs cookies/logins from the real profile first so the user stays logged in.
  */
 function _launchChromeWithCDP() {
+  // Sync cookies from real profile → debug profile
+  _syncProfileData();
+
   const debugDir = _getDebugUserDataDir();
   const port = 9222;
 
@@ -262,7 +325,6 @@ function _launchChromeWithCDP() {
       `--user-data-dir=${debugDir}`,
     ], { detached: true, stdio: 'ignore' }).unref();
   } else if (IS_WIN) {
-    // Try common Chrome locations on Windows
     const possiblePaths = [
       path.join(process.env['PROGRAMFILES'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
       path.join(process.env['PROGRAMFILES(X86)'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
@@ -284,43 +346,22 @@ function _launchChromeWithCDP() {
     ], { detached: true, stdio: 'ignore' }).unref();
   }
 
-  console.log(`[browser] Launched Chrome with CDP on port ${port} (profile: ${debugDir})`);
+  console.log(`[browser] Launched Chrome with CDP on port ${port} (debug profile, cookies synced)`);
   return true;
 }
 
 /**
  * Try to connect to Chrome's CDP on port 9222.
- * If Chrome isn't running with CDP, launches it automatically with the
- * correct flags (including --user-data-dir required by Chrome 136+).
+ * Does NOT auto-launch Chrome — just connects if it's already running with CDP.
+ * User should launch Chrome with --remote-debugging-port=9222 themselves.
  */
 async function autoConnectOrLaunchChrome() {
-  // Try existing CDP on port 9222
   const connected = await connectToChrome();
   if (connected) {
     return { connected: true, message: 'Connected to existing Chrome CDP' };
   }
 
-  // CDP not available — launch Chrome with debugging enabled
-  console.log('[browser] CDP not available, launching Chrome with debugging enabled...');
-  const launched = _launchChromeWithCDP();
-  if (!launched) {
-    _lastCDPFailReason = 'Could not find or launch Chrome';
-    return { connected: false, message: _lastCDPFailReason };
-  }
-
-  // Wait for Chrome to start and CDP to become available
-  for (let i = 0; i < 10; i++) {
-    await new Promise((r) => setTimeout(r, 1000));
-    const alive = await _isCDPAlive(9222);
-    if (alive) {
-      const ok = await connectToChrome();
-      if (ok) {
-        return { connected: true, message: 'Launched Chrome and connected via CDP' };
-      }
-    }
-  }
-
-  _lastCDPFailReason = 'Launched Chrome but CDP did not become available within 10s';
+  _lastCDPFailReason = 'Chrome not running with CDP. Launch Chrome with --remote-debugging-port=9222 to enable browser control.';
   console.log(`[browser] ${_lastCDPFailReason}`);
   return { connected: false, message: _lastCDPFailReason };
 }
@@ -770,6 +811,13 @@ async function cdpWaitForLoad(ms = 2000) {
 // Exports
 // ---------------------------------------------------------------------------
 
+/**
+ * Get foreground window title (re-exported for passive scanner).
+ */
+function getForegroundTitle() {
+  return _getForegroundTitle();
+}
+
 module.exports = {
   // Chrome
   connectToChrome,
@@ -779,6 +827,7 @@ module.exports = {
   isCDPAlive: _isCDPAlive,
   getPageContext,
   getCurrentPage,
+  getForegroundTitle,
   // Electron apps
   connectToApp,
   launchAndConnect,

@@ -6,11 +6,12 @@ const crypto = require('crypto');
 
 const { clipboard } = require('electron');
 const Memory = require('./memory');
+const Enrichment = require('./enrichment');
 const { buildOCRMap, getWorker } = require('./ocr-map');
 
-// Models — dynamic switching (Haiku fast default, Sonnet accurate on retry)
+// Models — Haiku is the only model that supports computer_20250124 tool type
 const MODEL_FAST = process.env.AI_MODEL_DEFAULT || 'claude-haiku-4-5-20251001';
-const MODEL_ACCURATE = 'claude-sonnet-4-6-20250514';
+const MODEL_ACCURATE = 'claude-haiku-4-5-20251001';
 
 const MAX_TOKENS = 4096;
 const MAX_ITERATIONS = 12;
@@ -41,12 +42,21 @@ const KEY_NORMALIZE = {
 
 const SYSTEM_PROMPT = `You are Jarvis — a sharp, proactive copilot controlling a Windows PC. You work WITH the user, not for them. Think ahead.
 
+ABSOLUTE RULES (violating these is a critical failure):
+1. ALWAYS take a screenshot FIRST before responding about what's on screen. NEVER guess or hallucinate screen content.
+2. ALWAYS use focus_window() to switch apps. NEVER click the taskbar. NEVER.
+3. ALWAYS bring the target window to the foreground before any action. The user must SEE what you're doing.
+4. NEVER ask clarifying questions for simple tasks. Just do it. "Open Chrome" → focus_window("Chrome"). Done.
+5. NEVER narrate your actions. No "Let me", "I'll", "Now I", "Trying to". Just execute silently.
+
 VOICE (mandatory):
 - Max 1 sentence. No filler. NEVER say "let me", "I'll now", "sure", "ok so", "I'm going to".
-- Trivial tasks (open app, click button, type text) → do silently. ZERO speech.
-- Only speak to: report a result, flag a risk, ask a blocking question, or share a proactive insight.
+- Trivial tasks (open app, click button, type text, switch windows) → ZERO speech. Complete silence.
+- Only speak to: report a FINAL result, flag a risk, or share a proactive insight.
+- NEVER ask "what do you want to do?" or "are you trying to?" — figure it out from context and act.
 - BAD: "Let me open Discord and find Mixo for you." GOOD: (silence — just do it)
 - BAD: "I've taken a screenshot to see the screen." GOOD: (silence — screenshots are internal)
+- BAD: "What would you like to do next?" GOOD: (silence — wait for user)
 - GOOD (proactive): "Sent. Heads up — Mixo was last active 3 hours ago."
 
 THINKING:
@@ -57,7 +67,7 @@ THINKING:
 
 TOOLS:
 1. computer — screenshot, click, type, key, scroll. PRIMARY for all desktop interactions.
-2. focus_window(title_pattern) — Win32 API window focus. ALWAYS use this instead of clicking taskbar.
+2. focus_window(title_pattern) — MANDATORY for switching apps. ALWAYS use this. NEVER click taskbar icons.
 3. browser_action — CDP for web pages. Faster than screenshot→click for websites.
 4. request_confirmation — REQUIRED before send/delete/purchase/submit. Nothing else needs it.
 
@@ -65,17 +75,41 @@ SPEED:
 - Act first, report after. Don't ask permission for read-only actions.
 - Chain multiple actions per turn. Don't take a screenshot between every action unless you need to see new state.
 - Use keyboard shortcuts over clicking whenever possible (ctrl+k, ctrl+l, ctrl+t, etc).
-- focus_window > taskbar click. Always.
+- focus_window > taskbar click. Always. No exceptions.
 
 RECIPES:
 - open app → key("super") → type("appname") → key("Return")
-- switch app → focus_window("AppName")
+- switch app → focus_window("AppName") — NEVER click taskbar
+- bring browser to front → focus_window("Chrome") — user must SEE the window
 - message on Discord → focus_window("Discord") → key("ctrl+k") → type("user") → key("Return") → type("msg") → key("Return")
-- open URL → browser_action navigate
+- open URL → focus_window("Chrome") → browser_action navigate
 - search in app → focus_window → keyboard shortcut (ctrl+k, ctrl+l, ctrl+f, etc)
+- switch tab → focus_window("Chrome") → browser_action switch_tab or Ctrl+Tab
+
+PROACTIVE THINKING (this is what makes you Jarvis, not just a clicker):
+Before executing ANY task, ask yourself these 3 questions silently:
+1. "What could go wrong that the user didn't think about?" → flag it
+2. "What info would a smart person auto-check here?" → check it in parallel
+3. "What would the user regret NOT knowing in 10 minutes?" → mention it
+
+Domain-specific proactiveness:
+- FLIGHTS/TRAVEL: check weather at destination, check if dates conflict with known schedule, compare airlines, flag layover length, mention baggage policy differences
+- EMAIL/MESSAGING: check if recipient is online/active, flag if >48hrs since their last message, check tone if it's a professional context, warn about reply-all vs reply
+- SCHEDULING: check for conflicts, suggest buffer time, mention timezone differences
+- FINANCE/PURCHASES: flag unusual amounts, check for better alternatives, mention return policies
+- FILE OPERATIONS: check disk space, warn about overwriting, suggest backup
+- RESEARCH: cross-reference multiple sources, flag outdated info, mention related topics the user might need
+- SOCIAL MEDIA: check notification count, flag unread DMs, mention if someone posted recently
+- APP SWITCHING: remember what user was doing in previous app (context preservation)
+
+When the user is clearly overwhelmed (multiple tasks, rushed tone, "just do it" energy):
+- Be MORE proactive, not less. They're the ones who forget things.
+- Batch related actions. If they ask about flights, also pull weather without being asked.
+- Surface risks they'd miss: "Sent. FYI that flight has a 45min layover in Denver — tight if delayed."
 
 MEMORY:
 - [Learned patterns] are injected into context from past interactions. Follow them.
+- [User profile] contains who the user is, their goals, schedule, preferences. Use this for proactive suggestions.
 - If you discover a faster/better way, just use it — it gets saved automatically.
 - If something failed before, the failure + fix are in context. Don't repeat the mistake.`;
 
@@ -113,17 +147,31 @@ class Agent {
     this.history = [];
     this.toolCallHistory = [];
     this.memory = new Memory();
+    this.enrichment = new Enrichment({ browser });
     this._currentActions = [];
     this._lastToolType = null;
     this._lastOCRMap = null;
+    this._lastFailedTool = null;
 
     // Preload tesseract WASM worker (non-blocking)
     getWorker().catch(() => { });
+
+    // Training mode state
+    this._trainingMode = false;
+    this._trainingTask = null;    // current task being trained on
+    this._demoRecording = false;  // true when recording user's demo
+    this._demoSnapshots = [];     // screen/cursor snapshots during demo
 
     // Model switching state
     this._currentModel = MODEL_FAST;
     this._retryCount = 0;
     this._lastScreenshotHash = null;
+
+    // Passive mode: busy flag
+    this._runLoopActive = false;
+
+    // Track last focused window for auto-refocus before computer actions
+    this._lastFocusedWindow = null;
 
     console.log(`[computer-use] Display: ${this.displayConfig.displayWidth}x${this.displayConfig.displayHeight} (scaled from ${this.displayConfig.physicalWidth}x${this.displayConfig.physicalHeight}, factor ${this.displayConfig.scaleX.toFixed(1)}x)`);
   }
@@ -288,6 +336,14 @@ class Agent {
 
     this._currentActions = [];
     this._chatStartTime = Date.now();
+    this._lastFailedTool = null;
+
+    // Training mode commands
+    const trainCmd = this._handleTrainingCommand(text);
+    if (trainCmd) {
+      console.timeEnd('[agent] chat total');
+      return trainCmd;
+    }
 
     // Check for precision hints → upgrade model
     if (/look carefully|be precise|be accurate|look closer|try harder/i.test(text)) {
@@ -295,17 +351,25 @@ class Agent {
       console.log('[agent] User requested precision — using accurate model');
     }
 
-    const ctx = await this._gatherContext();
-
-    // Get full memory context (playbooks + failures + preferences + user facts)
+    // Gather context, memory, and enrichments in parallel
     const detectedApp = this._detectAppFromText(text);
-    const memoryContext = this.memory.buildContextForPrompt(detectedApp, text);
+    const [ctx, memoryContext, enrichmentContext] = await Promise.all([
+      this._gatherContext(),
+      Promise.resolve(this.memory.buildContextForPrompt(detectedApp, text)),
+      this.enrichment.enrich(text, detectedApp).catch(() => ''),
+    ]);
 
-    const contextText = memoryContext ? `${ctx}\n\n${memoryContext}` : ctx;
+    let contextText = ctx;
+    if (memoryContext) contextText += `\n\n${memoryContext}`;
+    if (enrichmentContext) contextText += enrichmentContext;
+    if (this._trainingMode) {
+      contextText += '\n\n[TRAINING MODE ACTIVE: User is evaluating your performance. Execute the task as well as you can. Be proactive where appropriate. The user will rate you after.]';
+    }
     const content = [
       { type: 'text', text },
       { type: 'text', text: contextText },
     ];
+
 
     const historyLenBefore = this.history.length;
     this.history.push({ role: 'user', content });
@@ -316,6 +380,7 @@ class Agent {
     this.onProgress({ type: 'status', text: 'Thinking...' });
 
     try {
+      this._runLoopActive = true;
       const result = await this._runLoop();
       console.timeEnd('[agent] chat total');
       return result;
@@ -330,6 +395,8 @@ class Agent {
       }
 
       return { text: "Something went wrong, but I'm still here. Try again?" };
+    } finally {
+      this._runLoopActive = false;
     }
   }
 
@@ -337,8 +404,13 @@ class Agent {
   // Tool loop
   // =========================================================================
 
+  isBusy() {
+    return this._runLoopActive;
+  }
+
   async _runLoop() {
     let iterations = 0;
+    const spokenTexts = []; // Track text already emitted mid-loop to avoid duplicate speech
 
     while (true) {
       iterations++;
@@ -356,16 +428,24 @@ class Agent {
       // No tool calls → done
       if (toolUses.length === 0) {
         this._saveToMemory();
-        return { text: textParts.join('\n') || 'Done.' };
+        // Only return text that wasn't already spoken mid-loop
+        const finalText = textParts.join('\n').trim();
+        if (finalText && spokenTexts.includes(finalText)) {
+          return { text: '' }; // Already spoken via onProgress
+        }
+        return { text: finalText };
       }
 
       // Filter narration — Jarvis should act silently on trivial tasks
       if (textParts.length > 0) {
         const combined = textParts.join('\n').trim();
         // Kill ALL filler phrases — these waste voice time
-        const isNarration = /^(let me|i('ll| will)|now i|ok(ay)?[,.]?\s|trying to|sure[,!]?\s|i('m| am) going|i can see|i need to|i see |looking at|it looks like|good[,!]|perfect[,!]|great[,!]|alright[,!]|excellent)/i.test(combined);
-        if (combined && !isNarration) {
+        const isNarration = /^(let me|i('ll| will)|now i|ok(ay)?[,.]?\s|trying to|sure[,!]?\s|i('m| am) going|i can see|i need to|i see |looking at|it looks like|good[,!]|perfect[,!]|great[,!]|alright[,!]|excellent|that('s| is) the wrong|still on|let me (try|find|look|click|check|use|navigate|open|switch|press|type)|i('ll| will) (try|find|look|click|check|use|navigate|open|switch)|that opened|i don't see|i can see|the (page|tab|window) (still|is)|now let me|i need (to|clarity)|what (would you|are you|do you|specifically)|are you:|give me the)/i.test(combined);
+        // Also kill multi-paragraph "what do you want" responses
+        const isQuestion = /\?\s*\n|are you[:\n]|give me the|you still haven't/i.test(combined) && toolUses.length === 0;
+        if (combined && !isNarration && !isQuestion) {
           this.onProgress({ type: 'text', text: combined });
+          spokenTexts.push(combined);
         }
       }
 
@@ -494,6 +574,7 @@ class Agent {
 
   async _executeTool(name, input) {
     this._logToolCall(name, input);
+    const startTime = Date.now();
     try {
       // Hide overlay before ANY action that touches the desktop/browser —
       // the user must always see the target window in the foreground
@@ -501,30 +582,81 @@ class Agent {
         this.blurOverlayFn();
       }
 
-      if (name === 'computer') {
-        return await this._execComputerAction(input);
-      }
-
-      this._lastToolType = name;
-
       let result;
-      switch (name) {
-        case 'browser_action':
-          return await this._execBrowserAction(input);
-        case 'focus_window':
-          return await this._execFocusWindow(input);
-        case 'request_confirmation':
-          result = await this._execConfirmation(input);
-          break;
-        default:
-          result = [{ type: 'text', text: `Unknown tool: ${name}` }];
+      if (name === 'computer') {
+        result = await this._execComputerAction(input);
+      } else {
+        this._lastToolType = name;
+        switch (name) {
+          case 'browser_action':
+            result = await this._execBrowserAction(input);
+            break;
+          case 'focus_window':
+            result = await this._execFocusWindow(input);
+            break;
+          case 'request_confirmation':
+            result = await this._execConfirmation(input);
+            break;
+          default:
+            result = [{ type: 'text', text: `Unknown tool: ${name}` }];
+        }
       }
+
       this._logToolResult(name, result);
+      this._learnFromOutcome(name, input, result, Date.now() - startTime);
       return result;
     } catch (err) {
       const errResult = [{ type: 'text', text: `Error executing ${name}: ${err.message}` }];
       console.log(`[tool] ERROR ${name} → ${err.message}`);
+      this._learnFromOutcome(name, input, errResult, Date.now() - startTime);
       return errResult;
+    }
+  }
+
+  /**
+   * Self-learning: analyze tool outcome and record to memory.
+   * Tracks errors, slow actions, and successful patterns.
+   */
+  _learnFromOutcome(name, input, result, elapsed) {
+    // Skip screenshots — they're not "actions" that succeed/fail
+    if (name === 'computer' && input?.action === 'screenshot') return;
+    if (name === 'request_confirmation') return;
+
+    const resultText = result.filter(r => r.type === 'text').map(r => r.text).join(' ');
+    const isError = /failed|error|could not|not found|not available|no browser|no page/i.test(resultText);
+    const userText = this.history.find(m => m.role === 'user')?.content?.find?.(c => c.type === 'text')?.text || '';
+    const app = this._detectAppFromText(userText);
+
+    const actionLabel = `${name}(${input?.action || input?.title_pattern || ''})`;
+
+    if (isError && app) {
+      this._recordFailure(app, actionLabel, resultText.slice(0, 120), 'try different approach');
+    }
+
+    // Flag slow tool calls (>5s for a single action is slow)
+    if (elapsed > 5000 && app && !isError) {
+      console.log(`[learn] Slow action: ${actionLabel} took ${Math.round(elapsed / 1000)}s`);
+      this._recordFailure(app, actionLabel,
+        `slow: ${Math.round(elapsed / 1000)}s`,
+        'look for keyboard shortcut or faster path');
+    }
+
+    // Track tool type transitions for pattern learning
+    // e.g. if focus_window succeeded right after a click failed, that's a lesson
+    if (!isError && name === 'focus_window' && this._lastFailedTool === 'computer(left_click)') {
+      if (app) {
+        this._recordFailure(app, 'computer(left_click)',
+          'click failed to switch app',
+          `use focus_window("${input?.title_pattern || ''}") instead`);
+        console.log(`[learn] Pattern: focus_window works where click failed for ${app}`);
+      }
+    }
+
+    // Track last failed tool for transition learning
+    if (isError) {
+      this._lastFailedTool = actionLabel;
+    } else {
+      this._lastFailedTool = null;
     }
   }
 
@@ -727,6 +859,8 @@ class Agent {
     if (!result.ok) {
       return [{ type: 'text', text: `Could not focus window: ${result.error}` }];
     }
+    // Track last focused window for auto-refocus
+    this._lastFocusedWindow = input.title_pattern;
     await new Promise((r) => setTimeout(r, 300));
     const screenshot = await this._captureScreenshot(false);
     screenshot.unshift({ type: 'text', text: `Focused: ${result.process} — "${result.title}"` });
@@ -755,7 +889,23 @@ class Agent {
       }
     }
 
-    // Always bring browser to front so the user can see what's happening
+    // Always bring Chrome window to OS foreground so the user SEES it
+    if (this.computer && typeof this.computer.focusWindow === 'function') {
+      // Try multiple patterns — Chrome window title varies
+      let focused = false;
+      for (const pattern of ['Chrome', 'Google Chrome', 'Chromium']) {
+        const fwResult = await this.computer.focusWindow(pattern).catch(() => ({ ok: false }));
+        if (fwResult.ok) {
+          console.log(`[agent] Focused Chrome window: "${fwResult.title}"`);
+          focused = true;
+          await new Promise(r => setTimeout(r, 200));
+          break;
+        }
+      }
+      if (!focused) {
+        console.log('[agent] Could not focus any Chrome window');
+      }
+    }
     if (typeof this.browser.bringBrowserToFront === 'function') {
       await this.browser.bringBrowserToFront();
     }
@@ -975,6 +1125,264 @@ class Agent {
     this._currentModel = MODEL_FAST;
     this._retryCount = 0;
     this._lastScreenshotHash = null;
+    this._lastFailedTool = null;
+    // Don't reset training mode on clear -- keep it active across history clears
+  }
+
+  // =========================================================================
+  // Training mode
+  // =========================================================================
+
+  _handleTrainingCommand(text) {
+    const lower = text.toLowerCase().trim();
+
+    // Enter training mode
+    if (/^training\s*mode$/i.test(lower)) {
+      this._trainingMode = true;
+      this._trainingTask = null;
+      this._demoRecording = false;
+      console.log('[training] Training mode activated');
+      return { text: "Training mode active. Give me a task and I'll do my best. After each task, rate me with a feedback code: g, f, s, slow, wrong, narr, silent, p+, p-, demo, skip. Let's go." };
+    }
+
+    // Exit training mode
+    if (/^(training\s*done|done\s*training|exit\s*training|stop\s*training)$/i.test(lower)) {
+      this._trainingMode = false;
+      this._trainingTask = null;
+      this._demoRecording = false;
+      const pb = this.memory.playbooks.length;
+      const fl = this.memory.failures.length;
+      console.log('[training] Training mode deactivated');
+      return { text: `Training done. I have ${pb} playbook entries and ${fl} failure records. I'll be better next time.` };
+    }
+
+    if (!this._trainingMode) return null;
+
+    // If we're recording a demo and user says "done"
+    if (this._demoRecording && /^done$/i.test(lower)) {
+      return this._finishDemo();
+    }
+
+    // Handle feedback codes
+    const feedbackResult = this._parseTrainingFeedback(lower);
+    if (feedbackResult) return feedbackResult;
+
+    // Not a feedback code in training mode -- treat as a new task
+    this._trainingTask = text;
+    return null; // let it go through normal chat flow
+  }
+
+  _parseTrainingFeedback(text) {
+    const codes = text.split(/\s+/);
+    const validCodes = ['g', 'f', 's', 'slow', 'wrong', 'narr', 'silent', 'p+', 'p-', 'demo', 'skip'];
+
+    // Check if ALL parts are valid codes
+    if (!codes.every(c => validCodes.includes(c))) return null;
+
+    const task = this._trainingTask || 'unknown task';
+    const app = this._detectAppFromText(task);
+    const elapsed = this._chatStartTime ? Date.now() - this._chatStartTime : 0;
+    const results = [];
+
+    for (const code of codes) {
+      switch (code) {
+        case 'g':
+          this.memory.recordSuccess(task, app, this._currentActions.slice(0, 15), elapsed);
+          results.push('saved playbook');
+          break;
+        case 'f':
+          this.memory.recordFailure(app || 'unknown',
+            this._currentActions.map(a => `${a.tool}(${a.input?.action || ''})`).join(' > ') || 'attempted',
+            'user marked as failed', '');
+          results.push('failure recorded');
+          break;
+        case 's':
+          this.memory.recordFailure(app || 'unknown', 'loop', 'got stuck/looped on task', 'try different approach');
+          results.push('stuck pattern recorded');
+          break;
+        case 'slow':
+          this.memory.recordFailure(app || 'unknown',
+            this._currentActions.map(a => `${a.tool}(${a.input?.action || ''})`).join(' > ') || 'slow path',
+            `too slow: ${Math.round(elapsed / 1000)}s`, 'find faster approach or keyboard shortcut');
+          results.push('slow path recorded');
+          break;
+        case 'wrong':
+          this.memory.recordFailure(app || 'unknown',
+            this._currentActions.map(a => `${a.tool}(${a.input?.action || ''})`).join(' > ') || 'wrong action',
+            'did the wrong thing', 'review task intent more carefully');
+          results.push('wrong action recorded');
+          break;
+        case 'narr':
+          this.memory.recordFailure(app || 'unknown', 'voice', 'narrated when should have been silent', 'do trivial tasks silently');
+          results.push('noted: less talking');
+          break;
+        case 'silent':
+          this.memory.recordFailure(app || 'unknown', 'voice', 'was silent when proactive insight would have helped', 'speak up with useful info');
+          results.push('noted: be more proactive');
+          break;
+        case 'p+':
+          this.memory.addContext(`Proactive behavior appreciated during: ${task}`, 'training');
+          results.push('proactivity reinforced');
+          break;
+        case 'p-':
+          this.memory.recordFailure(app || 'unknown', 'proactivity', `missed proactive opportunity during: ${task}`, 'check enrichment hints and think ahead');
+          results.push('missed proactivity recorded');
+          break;
+        case 'demo':
+          return this._startDemo();
+        case 'skip':
+          results.push('skipped');
+          break;
+      }
+    }
+
+    this._trainingTask = null;
+    console.log(`[training] Feedback for "${task.slice(0, 40)}": ${codes.join(' ')} → ${results.join(', ')}`);
+    return { text: `Got it: ${results.join(', ')}. Next task?` };
+  }
+
+  _startDemo() {
+    this._demoRecording = true;
+    this._demoSnapshots = [];
+    this._demoStartTime = Date.now();
+
+    // Capture initial state
+    this._captureDemoSnapshot('before');
+
+    // Start polling snapshots every 500ms
+    this._demoInterval = setInterval(() => {
+      if (this._demoRecording) this._captureDemoSnapshot('during');
+    }, 500);
+
+    console.log(`[training] Demo recording started for: "${(this._trainingTask || '').slice(0, 40)}"`);
+    return { text: "Recording. Do the task now -- I'm watching your screen and cursor. Say 'done' when you're finished." };
+  }
+
+  async _captureDemoSnapshot(phase) {
+    try {
+      const snapshot = { phase, timestamp: Date.now() };
+
+      // Cursor position
+      if (this.computer && typeof this.computer.getCursorPosition === 'function') {
+        snapshot.cursor = this.computer.getCursorPosition();
+      }
+
+      // Foreground window
+      if (this.computer && typeof this.computer.getForegroundWindowTitle === 'function') {
+        snapshot.foreground = this.computer.getForegroundWindowTitle();
+      }
+
+      // Screenshot for before/after only (not every 500ms -- too heavy)
+      if (phase !== 'during' && this.screenshotFn) {
+        const ss = await this.screenshotFn();
+        if (ss && ss.ok) {
+          snapshot.screenshotSize = ss.data.length;
+          // Run OCR on before/after screenshots
+          try {
+            const buffer = Buffer.from(ss.data, 'base64');
+            const { buildOCRMap } = require('./ocr-map');
+            const ocrMap = await buildOCRMap(buffer);
+            snapshot.ocrLabels = Object.keys(ocrMap).slice(0, 50);
+            snapshot.ocrMap = ocrMap;
+          } catch { /* OCR optional */ }
+        }
+      }
+
+      this._demoSnapshots.push(snapshot);
+    } catch (err) {
+      console.error('[training] Snapshot error:', err.message);
+    }
+  }
+
+  _finishDemo() {
+    this._demoRecording = false;
+    if (this._demoInterval) {
+      clearInterval(this._demoInterval);
+      this._demoInterval = null;
+    }
+
+    // Capture final state
+    this._captureDemoSnapshot('after');
+
+    const task = this._trainingTask || 'unknown task';
+    const app = this._detectAppFromText(task);
+    const elapsed = Date.now() - (this._demoStartTime || Date.now());
+    const snapshots = this._demoSnapshots;
+
+    // Extract what changed
+    const before = snapshots.find(s => s.phase === 'before') || {};
+    const after = snapshots.find(s => s.phase === 'after') || {};
+    const duringSnapshots = snapshots.filter(s => s.phase === 'during');
+
+    // Track cursor movement path
+    const cursorPath = duringSnapshots
+      .filter(s => s.cursor)
+      .map(s => ({ x: s.cursor.x, y: s.cursor.y, t: s.timestamp }));
+
+    // Track window switches
+    const windowSwitches = [];
+    let lastWindow = before.foreground || '';
+    for (const s of duringSnapshots) {
+      if (s.foreground && s.foreground !== lastWindow) {
+        windowSwitches.push({ from: lastWindow, to: s.foreground, t: s.timestamp });
+        lastWindow = s.foreground;
+      }
+    }
+
+    // Build playbook from demo
+    const playbook = {
+      task,
+      app: app || 'unknown',
+      source: 'user_demo',
+      executionContext: {
+        foregroundBefore: before.foreground || '',
+        foregroundAfter: after.foreground || '',
+        cursorStart: before.cursor || { x: 0, y: 0 },
+        cursorEnd: after.cursor || { x: 0, y: 0 },
+        cursorPath: cursorPath.slice(0, 50),
+        windowSwitches,
+        ocrBefore: before.ocrLabels || [],
+        ocrAfter: after.ocrLabels || [],
+        elapsed,
+        snapshotCount: snapshots.length,
+      },
+      recordedAt: Date.now(),
+    };
+
+    // Save to memory
+    try {
+      // Save as a recorded playbook
+      const fs = require('fs');
+      const path = require('path');
+      const recDir = path.join(__dirname, '..', 'data', 'recordings');
+      if (!fs.existsSync(recDir)) fs.mkdirSync(recDir, { recursive: true });
+
+      const filename = `demo_${Date.now()}.json`;
+      fs.writeFileSync(path.join(recDir, filename), JSON.stringify(playbook, null, 2));
+
+      // Also add to the playbooks export for memory.js to pick up
+      const exportFile = path.join(recDir, '_playbooks_export.json');
+      let exported = [];
+      try { exported = JSON.parse(fs.readFileSync(exportFile, 'utf8')); } catch { /* fresh */ }
+      exported.push(playbook);
+      fs.writeFileSync(exportFile, JSON.stringify(exported, null, 2));
+
+      // Reload into memory
+      this.memory._loadRecordedPlaybooks();
+
+      console.log(`[training] Demo saved: ${filename} (${snapshots.length} snapshots, ${windowSwitches.length} window switches, ${Math.round(elapsed / 1000)}s)`);
+    } catch (err) {
+      console.error('[training] Demo save error:', err.message);
+    }
+
+    this._trainingTask = null;
+    this._demoSnapshots = [];
+
+    const switchInfo = windowSwitches.length > 0
+      ? ` You switched through: ${windowSwitches.map(w => w.to).join(' > ')}.`
+      : '';
+
+    return { text: `Recorded. ${Math.round(elapsed / 1000)}s, ${snapshots.length} snapshots.${switchInfo} I'll use this approach next time. Next task?` };
   }
 
   _detectAppFromText(text) {
@@ -995,6 +1403,16 @@ class Agent {
     try {
       this.memory.recordSuccess(userText, app, this._currentActions.slice(0, 15), elapsed);
       console.log(`[memory] Saved playbook: "${userText.slice(0, 40)}" → ${this._currentActions.length} actions, ${Math.round(elapsed / 1000)}s`);
+
+      // Learn preferences from action patterns
+      if (app) {
+        const usedKeyboard = this._currentActions.some(a =>
+          a.tool === 'computer' && a.input?.action === 'key'
+        );
+        const usedFocusWindow = this._currentActions.some(a => a.tool === 'focus_window');
+        if (usedKeyboard) this.memory.setPreference(`${app}_prefers_keyboard`, true);
+        if (usedFocusWindow) this.memory.setPreference(`${app}_uses_focus_window`, true);
+      }
     } catch (err) {
       console.error('[agent] memory save error:', err.message);
     }

@@ -54,7 +54,11 @@
       "Bash(pkill:*)",
       "Bash(lsof:*)",
       "Bash(open:*)",
-      "Bash(osascript:*)"
+      "Bash(osascript:*)",
+      "Bash(git show:*)",
+      "Bash(npx jest:*)",
+      "Bash(tasklist:*)",
+      "Bash(source:*)"
     ]
   }
 }

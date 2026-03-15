@@ -378,11 +378,27 @@ class Computer {
     try {
       const windows = this._enumWindows();
       const regex = new RegExp(titlePattern, 'i');
-      const match = windows.find((w) => regex.test(w.title));
+      const candidates = windows.filter((w) => regex.test(w.title));
 
-      if (!match) {
+      if (candidates.length === 0) {
         return { ok: false, error: `No window matching "${titlePattern}"` };
       }
+
+      // Rank: prefer process name match > title starts with pattern > substring match
+      // This prevents Chrome tabs containing "discord" from beating the Discord app
+      const pattern = titlePattern.toLowerCase();
+      const ranked = candidates.map((w) => {
+        const proc = (this._getProcessName(w.pid) || '').toLowerCase();
+        const title = w.title.toLowerCase();
+        let score = 0;
+        if (proc.includes(pattern)) score += 100;           // Process name match (e.g. Discord.exe)
+        if (title.startsWith(pattern)) score += 50;         // Title starts with pattern
+        if (title === pattern) score += 200;                // Exact match
+        if (proc === 'chrome' || proc === 'explorer') score -= 20; // Deprioritize browser tabs
+        return { ...w, score };
+      });
+      ranked.sort((a, b) => b.score - a.score);
+      const match = ranked[0];
 
       const fgHwnd = GetForegroundWindow();
       const fgPidBuf = Buffer.alloc(4);

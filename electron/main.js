@@ -33,6 +33,7 @@ const path = require('path');
 const { menubar } = require('menubar');
 const Agent = require('../src/agent');
 const Computer = require('../src/computer');
+const PassiveMonitor = require('../src/passive/monitor');
 const USE_MCP = process.env.USE_MCP_BROWSER === '1';
 const browser = USE_MCP ? require('../src/mcp-browser') : require('../src/browser');
 
@@ -46,8 +47,10 @@ const PANEL_HEIGHT = 480;
 let mb = null;
 let agent = null;
 let computer = null;
+let passiveMonitor = null;
 let displayConfig = null;
 let isQuitting = false;
+let agentHidOverlay = false; // true when agent hid overlay for tool execution (don't reset panel)
 
 // Single instance lock
 const gotLock = app.requestSingleInstanceLock();
@@ -252,6 +255,13 @@ ipcMain.on('clear-history', () => {
 ipcMain.on('show-panel', () => {
   // showInactive — NEVER steal focus from the target app
   if (mb && mb.window && !mb.window.isDestroyed()) {
+    // Re-expand to panel size if it was collapsed to orb by a hide
+    const bounds = mb.window.getBounds();
+    if (bounds.width === ORB_WINDOW_SIZE && bounds.height === ORB_WINDOW_SIZE) {
+      const cx = bounds.x + Math.round(bounds.width / 2);
+      const newX = Math.round(cx - PANEL_WIDTH / 2);
+      mb.window.setBounds({ x: newX, y: bounds.y, width: PANEL_WIDTH, height: PANEL_HEIGHT });
+    }
     mb.window.showInactive();
   }
 });
@@ -305,6 +315,26 @@ ipcMain.on('collapse-panel', () => {
   mb.window.setBounds({ x: newX, y: bounds.y, width: ORB_WINDOW_SIZE, height: ORB_WINDOW_SIZE });
 });
 
+// Passive mode IPC handlers
+ipcMain.on('nudge-dismissed', (_event, category) => {
+  if (passiveMonitor) passiveMonitor.delivery.onDismissed(category);
+});
+
+ipcMain.on('tts-state', (_event, speaking) => {
+  if (passiveMonitor) passiveMonitor.delivery.setTTSSpeaking(speaking);
+});
+
+ipcMain.on('toggle-passive-mode', () => {
+  if (!passiveMonitor) return;
+  if (passiveMonitor.isActive()) {
+    passiveMonitor.pause();
+    sendToRenderer('agent-progress', { type: 'text', text: 'Passive mode paused.' });
+  } else {
+    passiveMonitor.resume();
+    sendToRenderer('agent-progress', { type: 'text', text: 'Passive mode resumed.' });
+  }
+});
+
 // Whisper API fallback for voice transcription
 ipcMain.handle('transcribe-audio', async (_event, { audioBase64 }) => {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -355,18 +385,24 @@ app.whenReady().then(async () => {
       transparent: true,
       hasShadow: false,
       backgroundColor: '#00000000',
-      alwaysOnTop: false,
+      alwaysOnTop: true,
       skipTaskbar: true,
       webPreferences: {
         preload: path.join(__dirname, 'preload.js'),
         contextIsolation: true,
         nodeIntegration: false,
+        backgroundThrottling: false, // Keep mic/audio alive when window is inactive
       },
     },
   });
 
   mb.on('ready', async () => {
     console.log('[startup] Tray app ready');
+
+    // Forward renderer console logs to main process stdout
+    mb.window.webContents.on('console-message', (_e, _level, message) => {
+      console.log(`[renderer] ${message}`);
+    });
 
     // Init native computer control
     computer = new Computer();
@@ -399,7 +435,8 @@ app.whenReady().then(async () => {
       displayConfig,
       blurOverlayFn: () => {
         if (mb.window && !mb.window.isDestroyed()) {
-          mb.window.hide();
+          // Just blur — don't hide. The orb must NEVER vanish.
+          mb.window.blur();
         }
       },
       hideOverlayFn: () => {
@@ -425,17 +462,42 @@ app.whenReady().then(async () => {
 
     console.log('[startup] Agent ready (computer-use API) — hey, ready when you are');
 
+    // Init passive monitor (Mode 2)
+    passiveMonitor = new PassiveMonitor({
+      browser,
+      computer,
+      agent,
+      memory: agent.memory,
+      sendToRenderer,
+    });
+    passiveMonitor.start();
+    console.log('[startup] Passive monitor started (30s scan loop)');
+
     // Register hotkey: Ctrl+Shift+Space activates voice
     globalShortcut.register('Ctrl+Shift+Space', () => {
       sendToRenderer('start-listening');
     });
+
+    // Auto-show orb — give it brief focus so mic/AudioContext activates
+    mb.showWindow();
+    mb.window.focus();
+    // Release focus after mic initializes
+    setTimeout(() => {
+      if (mb.window && !mb.window.isDestroyed()) mb.window.blur();
+    }, 1500);
+    console.log('[startup] Orb visible');
   });
 
-  // On hide: reset to orb mode and collapse window
+  // On hide: collapse to orb but keep visible — orb must NEVER vanish
   mb.on('hide', () => {
+    if (agentHidOverlay) {
+      // Agent hid the overlay to execute a tool — don't reset panel
+      agentHidOverlay = false;
+      return;
+    }
     sendToRenderer('focus-lost');
     sendToRenderer('panel-reset');
-    // Collapse window back to orb size
+    // Collapse to orb size and re-show as inactive (no focus steal)
     if (mb.window && !mb.window.isDestroyed()) {
       const bounds = mb.window.getBounds();
       if (bounds.width !== ORB_WINDOW_SIZE || bounds.height !== ORB_WINDOW_SIZE) {
@@ -443,12 +505,15 @@ app.whenReady().then(async () => {
         const newX = Math.round(cx - ORB_WINDOW_SIZE / 2);
         mb.window.setBounds({ x: newX, y: bounds.y, width: ORB_WINDOW_SIZE, height: ORB_WINDOW_SIZE });
       }
+      // Keep orb visible — never fully hide
+      mb.window.showInactive();
     }
   });
 });
 
 app.on('before-quit', () => {
   isQuitting = true;
+  if (passiveMonitor) passiveMonitor.stop();
 });
 
 app.on('will-quit', () => {

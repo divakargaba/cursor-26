@@ -297,6 +297,21 @@
   #btn-send:hover { background:var(--accent-blue); transform:scale(1.05); }
   #btn-send:active { transform:scale(0.95); }
   #btn-send.visible { display:flex; }
+  #btn-always-on {
+    width:28px; height:28px; border-radius:50%; background:transparent;
+    color:var(--text-muted); border:1px solid transparent;
+    cursor:pointer; display:flex; align-items:center; justify-content:center;
+    transition:all 0.2s ease; flex-shrink:0; position:relative; padding:0;
+  }
+  #btn-always-on svg { width:14px; height:14px; fill:currentColor; }
+  #btn-always-on:hover { color:var(--text-secondary); }
+  #btn-always-on.active { color:var(--accent-green); }
+  #btn-always-on.active::after {
+    content:''; position:absolute; top:2px; right:2px; width:6px; height:6px;
+    border-radius:50%; background:var(--accent-green);
+    animation:aoPulse 2s ease-in-out infinite;
+  }
+  @keyframes aoPulse { 0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.4;transform:scale(0.8)} }
   #hotkey-hint {
     font-family:'Outfit',sans-serif; font-weight:300; font-size:9px;
     color:var(--text-muted); text-align:center; padding:0 12px 6px; letter-spacing:0.04em;
@@ -373,6 +388,9 @@
 
     <div id="input-area">
       <div id="input-bar">
+        <button id="btn-always-on" title="Always-on &quot;Hey Jarvis&quot;">
+          <svg viewBox="0 0 16 16"><path d="M8 1C4.7 1 2 3.7 2 7v3.4L1 12v1h14v-1l-1-1.6V7c0-3.3-2.7-6-6-6zm0 14a2 2 0 0 1-2-2h4a2 2 0 0 1-2 2z"/></svg>
+        </button>
         <button id="btn-mic" title="Voice input">
           <svg viewBox="0 0 16 16"><path d="M8 1a2.5 2.5 0 0 0-2.5 2.5v4a2.5 2.5 0 0 0 5 0v-4A2.5 2.5 0 0 0 8 1zM4 6.5a.5.5 0 0 0-1 0 5 5 0 0 0 4.5 4.975V13.5h-2a.5.5 0 0 0 0 1h5a.5.5 0 0 0 0-1h-2v-2.025A5 5 0 0 0 13 6.5a.5.5 0 0 0-1 0 4 4 0 1 1-8 0z"/></svg>
         </button>
@@ -889,8 +907,8 @@ function speak(text) {
   const v=window.speechSynthesis.getVoices();
   const pref=v.find(v=>v.name.includes('Microsoft Zira')||v.name.includes('Microsoft David')||v.name.includes('Google'));
   if(pref)u.voice=pref;
-  u.onstart=()=>setOrbState('speaking');
-  u.onend=()=>setOrbState('idle');
+  u.onstart=()=>{setOrbState('speaking');window.aiAssistant.reportTTSState(true);};
+  u.onend=()=>{setOrbState('idle');window.aiAssistant.reportTTSState(false);};
   window.speechSynthesis.speak(u);
 }
 
@@ -908,9 +926,11 @@ function isSystemMessage(t){
   return l.includes('speech api')||l.includes('switching to whisper')||l.includes('microphone')||l.includes('not supported')||l.includes('fallback');
 }
 
+let voiceOnlyMode=false; // true when processing a voice/wake-word command — stay in orb
+
 function addMessage(role,text){
-  // Auto-expand if in orb mode
-  if (panelMode === 'orb') expandToPanel();
+  // Auto-expand if in orb mode (but NOT during voice-only commands)
+  if (panelMode === 'orb' && !voiceOnlyMode) expandToPanel();
 
   if(role==='assistant'&&isSystemMessage(text)){
     const s=document.createElement('div');s.className='system-msg';
@@ -932,7 +952,7 @@ function addMessage(role,text){
 const statusTextEl=document.getElementById('status-text');
 let typingTl=null;
 function showTyping(msg){
-  if (panelMode === 'orb') expandToPanel();
+  if (panelMode === 'orb' && !voiceOnlyMode) expandToPanel();
   typingEl.style.display='flex';
   if(msg){statusTextEl.textContent=msg;statusTextEl.style.display='inline';}
   else{statusTextEl.style.display='none';}
@@ -976,9 +996,18 @@ async function sendMessage(text){
   addMessage('user',text);showTyping();setOrbState('thinking');
   try{
     const r=await window.aiAssistant.sendMessage(text);hideTyping();window.aiAssistant.showPanel();
-    if(r.ok){addMessage('assistant',r.reply.text);speak(r.reply.text);if(r.reply.actionPreview)showActionPreview(r.reply.actionPreview);}
+    if(r.ok){
+      if(r.reply.text) {
+        addMessage('assistant',r.reply.text);
+        speak(r.reply.text);
+      } else {
+        setOrbState('idle'); // no text to speak — reset orb manually
+      }
+      if(r.reply.actionPreview)showActionPreview(r.reply.actionPreview);
+    }
     else{setOrbState('idle');addMessage('assistant','Something went wrong. Try again.');speak('Something went wrong. Try again.');}
-  }catch(e){hideTyping();setOrbState('idle');addMessage('assistant','Connection error. Is the app running?');}
+    alwaysOn.resume(); // resume wake word detection after agent finishes
+  }catch(e){hideTyping();setOrbState('idle');addMessage('assistant','Connection error. Is the app running?');alwaysOn.resume();}
 }
 async function confirmAction(){if(!currentActionId)return;const id=currentActionId;hideActionPreview();await window.aiAssistant.confirmAction(id);}
 function cancelConfirmation(){if(!currentActionId)return;const id=currentActionId;hideActionPreview();window.aiAssistant.cancelAction(id);}
@@ -1004,12 +1033,74 @@ textInput.addEventListener('focus',clearAutoClose);
 
 const micBtn=document.getElementById('btn-mic');
 const voice=new VoiceInput({
-  onResult:t=>sendMessage(t),onInterim:t=>showTyping(t),
+  onResult:t=>{
+    // Voice input stays in orb mode — no panel expansion
+    if(panelMode==='orb') sendVoiceCommand(t);
+    else sendMessage(t);
+  },
+  onInterim:t=>{if(panelMode==='panel')showTyping(t);},
   onStart:()=>{micBtn.classList.add('listening');setOrbState('listening');},
   onStop:()=>{micBtn.classList.remove('listening');},
-  onError:m=>{addMessage('assistant',m);setOrbState('idle');},
+  onError:m=>{if(panelMode==='panel')addMessage('assistant',m);setOrbState('idle');},
 });
 micBtn.addEventListener('click',()=>voice.toggle());
+
+// Always-on "Hey Jarvis" wake word listener
+const aoBtn=document.getElementById('btn-always-on');
+
+// Voice-only send: stays in orb mode, no panel expansion, pure voice I/O
+let _voiceCommandBusy=false;
+async function sendVoiceCommand(text){
+  if(!text||!text.trim())return;text=text.trim();
+  if(_voiceCommandBusy){console.log('[voice] Skipping — agent busy');return;}
+  _voiceCommandBusy=true;
+  window.aiAssistant.clearHistory(); // fresh context per voice command
+  voiceOnlyMode=true;
+  setOrbState('thinking');
+  try{
+    const r=await window.aiAssistant.sendMessage(text);
+    if(r.ok){
+      if(r.reply.text){speak(r.reply.text);}
+      setOrbState('idle');
+    }else{setOrbState('idle');speak('Something went wrong.');}
+    alwaysOn.resume();
+  }catch(e){setOrbState('idle');speak('Connection error.');alwaysOn.resume();}
+  voiceOnlyMode=false;
+  _voiceCommandBusy=false;
+}
+
+const alwaysOn=new AlwaysOnListener({
+  onWakeWord:(command)=>{
+    if(command){
+      // Wake word + command: "Jarvis open Discord" — stay in orb, voice only
+      sendVoiceCommand(command);
+    } else {
+      // Just "Jarvis" — activate mic for follow-up command
+      if(!voice.isListening) voice.toggle();
+    }
+  },
+  onActiveStart:()=>{
+    setOrbState('listening');
+  },
+  onActiveEnd:()=>{
+    if(!voice.isListening) setOrbState('idle');
+  },
+  onError:(msg)=>{
+    console.log('[always-on] Error:',msg);
+    aoBtn.classList.remove('active');
+  },
+});
+
+// Auto-start wake word — delay to ensure window has focus for mic permission
+setTimeout(() => { alwaysOn.start(); }, 2500);
+aoBtn.classList.add('active');
+
+aoBtn.addEventListener('click',()=>{
+  const active=alwaysOn.toggle();
+  aoBtn.classList.toggle('active',active);
+  if(active) showToast('"Hey Jarvis" is listening');
+  else showToast('Always-on disabled');
+});
 
 // ═══════════════════════════════════════════════════════════════
 // IPC HOOKS
@@ -1043,6 +1134,19 @@ window.aiAssistant.onDomContextUpdate(data=>{
   const pill=document.getElementById('context-pill');
   if(data&&data.appType){pill.textContent=data.appType;pill.style.display='inline-block';}
   else{pill.style.display='none';}
+});
+
+// Passive mode: nudge toast
+let nudgeToastTimer=null;
+window.aiAssistant.onPassiveNudge(data=>{
+  // Show as toast + speak it
+  showToast(data.text);
+  speak(data.text);
+  // Show dismiss button via toast — clicking dismisses the category
+  clearTimeout(nudgeToastTimer);
+  nudgeToastTimer=setTimeout(()=>{
+    window.aiAssistant.dismissNudge(data.category);
+  },15000); // auto-dismiss after 15s if not acted on
 });
 
 if(window.speechSynthesis){window.speechSynthesis.getVoices();window.speechSynthesis.onvoiceschanged=()=>window.speechSynthesis.getVoices();}

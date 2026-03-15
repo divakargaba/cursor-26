@@ -4,6 +4,8 @@ const fs = require('fs');
 const path = require('path');
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
+const USER_PROFILE_PATH = path.join(__dirname, '..', 'omar.md');
+const RECORDINGS_DIR = path.join(DATA_DIR, 'recordings');
 const FILES = {
   playbooks: path.join(DATA_DIR, 'playbooks.json'),
   failures: path.join(DATA_DIR, 'failures.json'),
@@ -21,8 +23,12 @@ class Memory {
     this.failures = [];    // What broke + how it was fixed
     this.preferences = {}; // Learned user behavior patterns
     this.context = [];     // User facts, goals, info mentioned in convo
+    this.userProfile = ''; // Loaded from omar.md
+    this.recordedPlaybooks = []; // Rich execution traces from recorder
     this._ensureDir();
     this._loadAll();
+    this._loadUserProfile();
+    this._loadRecordedPlaybooks();
   }
 
   _ensureDir() {
@@ -278,7 +284,87 @@ class Memory {
       parts.push(`[User context:]\n${facts.join('\n')}`);
     }
 
+    // 5. Recorded execution traces
+    const recordedCtx = this.getRecordedContext(app, task);
+    if (recordedCtx) parts.push(recordedCtx);
+
+    // 6. User profile (who the user is — for proactive personalization)
+    if (this.userProfile) {
+      parts.push(`[User profile:]\n${this.userProfile}`);
+    }
+
     return parts.length > 0 ? parts.join('\n\n') : '';
+  }
+
+  // ===========================================================================
+  // USER PROFILE — loaded from omar.md
+  // ===========================================================================
+
+  _loadUserProfile() {
+    try {
+      if (fs.existsSync(USER_PROFILE_PATH)) {
+        this.userProfile = fs.readFileSync(USER_PROFILE_PATH, 'utf8').trim();
+        console.log(`[memory] User profile loaded (${this.userProfile.length} chars)`);
+      }
+    } catch (err) {
+      console.warn('[memory] Could not load user profile:', err.message);
+    }
+  }
+
+  // ===========================================================================
+  // RECORDED PLAYBOOKS — rich execution traces from recorder.js
+  // ===========================================================================
+
+  _loadRecordedPlaybooks() {
+    try {
+      const exportFile = path.join(RECORDINGS_DIR, '_playbooks_export.json');
+      if (fs.existsSync(exportFile)) {
+        this.recordedPlaybooks = JSON.parse(fs.readFileSync(exportFile, 'utf8'));
+        console.log(`[memory] Loaded ${this.recordedPlaybooks.length} recorded playbooks`);
+      }
+    } catch (err) {
+      console.warn('[memory] Could not load recorded playbooks:', err.message);
+    }
+  }
+
+  /**
+   * Get recorded execution context for a task domain/app.
+   * Returns rich context about how the user actually executes tasks.
+   */
+  getRecordedContext(app, task) {
+    if (this.recordedPlaybooks.length === 0) return '';
+
+    const appLower = (app || '').toLowerCase();
+    const taskLower = (task || '').toLowerCase();
+
+    // Match by app or domain
+    const relevant = this.recordedPlaybooks.filter(rp => {
+      if (appLower && rp.app === appLower) return true;
+      if (taskLower) {
+        const label = (rp.instruction || rp.task || '').toLowerCase();
+        if (!label) return false;
+        const words = taskLower.split(/\s+/);
+        return words.some(w => label.includes(w));
+      }
+      return false;
+    }).slice(0, 3);
+
+    if (relevant.length === 0) return '';
+
+    const entries = relevant.map(rp => {
+      const ctx = rp.executionContext || {};
+      const landmarks = (ctx.ocrLandmarks || [])
+        .slice(0, 5)
+        .map(l => `"${l.label}"@(${l.x},${l.y})`)
+        .join(', ');
+      return `  Task: "${rp.instruction || rp.task || 'unknown'}"
+    Window flow: "${ctx.foregroundBefore}" → "${ctx.foregroundAfter}"
+    Cursor: (${ctx.cursorStart?.x},${ctx.cursorStart?.y}) → (${ctx.cursorEnd?.x},${ctx.cursorEnd?.y})
+    Landmarks: ${landmarks || 'none recorded'}
+    Time: ${Math.round((ctx.elapsed || 0) / 1000)}s`;
+    });
+
+    return `[Recorded execution traces for ${app || 'similar tasks'}:]\n${entries.join('\n')}`;
   }
 
   // ===========================================================================
