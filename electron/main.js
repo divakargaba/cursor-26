@@ -13,7 +13,8 @@ const path = require('path');
 const { menubar } = require('menubar');
 const Agent = require('../src/agent');
 const Computer = require('../src/computer');
-const browser = require('../src/browser');
+const USE_MCP = process.env.USE_MCP_BROWSER === '1';
+const browser = USE_MCP ? require('../src/mcp-browser') : require('../src/browser');
 
 // Target long edge for downscaled screenshots (Anthropic recommends 1024x768 max)
 const TARGET_LONG_EDGE = 1024;
@@ -247,14 +248,19 @@ app.whenReady().then(async () => {
     displayConfig = computeDisplayConfig();
     console.log(`[startup] Display: ${displayConfig.displayWidth}x${displayConfig.displayHeight} (physical ${displayConfig.physicalWidth}x${displayConfig.physicalHeight}, scale ${displayConfig.scaleX.toFixed(2)}x)`);
 
-    // Try CDP connect to Chrome
+    // Connect to Chrome (Playwright CDP or MCP depending on USE_MCP_BROWSER)
     let cdpResult = { connected: false, message: 'Skipped' };
     try {
-      cdpResult = await browser.autoConnectOrLaunchChrome();
+      if (USE_MCP) {
+        cdpResult = await browser.autoConnectOrLaunchChrome({ noUsageStatistics: true });
+        console.log(`[startup] Chrome MCP: ${cdpResult.message}`);
+      } else {
+        cdpResult = await browser.autoConnectOrLaunchChrome();
+        console.log(`[startup] Chrome CDP: ${cdpResult.message}`);
+      }
     } catch (err) {
-      console.log('[startup] CDP auto-connect error:', err.message);
+      console.log('[startup] Browser connect error:', err.message);
     }
-    console.log(`[startup] Chrome CDP: ${cdpResult.message}`);
 
     // Init agent with computer-use display config
     agent = new Agent({

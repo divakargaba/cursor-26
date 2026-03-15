@@ -5,10 +5,11 @@ const Anthropic = require('@anthropic-ai/sdk');
 const crypto = require('crypto');
 
 const Memory = require('./memory');
+const { buildOCRMap, getWorker } = require('./ocr-map');
 
 // Models — dynamic switching (Haiku fast default, Sonnet accurate on retry)
-const MODEL_FAST = 'claude-haiku-4-5-20251001';
-const MODEL_ACCURATE = 'claude-sonnet-4-5';
+const MODEL_FAST = process.env.AI_MODEL_DEFAULT || 'claude-haiku-4-5-20251001';
+const MODEL_ACCURATE = 'claude-sonnet-4-6-20250514';
 
 const MAX_TOKENS = 4096;
 const MAX_ITERATIONS = 12;
@@ -41,23 +42,26 @@ const SYSTEM_PROMPT = `You control a Windows PC via screenshots and mouse/keyboa
 
 TOOLS:
 1. computer — screenshot, click, type, key, scroll. Your PRIMARY tool for all desktop interactions.
-2. browser_action — CDP for web pages (faster than clicking for websites). Auto-connects to Chrome.
-3. request_confirmation — ALWAYS before send/delete/purchase/submit.
+2. focus_window — focus a window by title (Win32 API). Use INSTEAD of clicking the taskbar.
+3. browser_action — CDP for web pages (faster than clicking for websites). Auto-connects to Chrome.
+4. request_confirmation — ALWAYS before send/delete/purchase/submit.
 
 RULES:
 1. Take a screenshot first if you need to see the screen.
-2. Click targets by coordinates from screenshots — you're trained for pixel-accurate clicking.
-3. Use browser_action for web interactions when CDP is connected (faster than screenshot→click cycle).
-4. request_confirmation before any destructive or externally-visible action.
-5. If stuck after 3 tries, tell the user. Don't loop.
-6. Complete tasks efficiently — minimum screenshots, maximum action per turn.
+2. Screenshots include OCR text labels with coordinates (e.g. "Discord"@(450,560) 95%). Cross-reference these with what you see to verify click targets — especially for similar-looking icons.
+3. Click targets by coordinates from screenshots — you're trained for pixel-accurate clicking. Use OCR coordinates when visual identification is ambiguous.
+4. Use browser_action for web interactions when CDP is connected (faster than screenshot→click cycle).
+5. request_confirmation before any destructive or externally-visible action.
+6. If stuck after 3 tries, tell the user. Don't loop.
+7. Complete tasks efficiently — minimum screenshots, maximum action per turn.
 
 RECIPES:
 - "type X in Notepad" → screenshot → find Notepad → click it → type text
 - "open Discord" → key("super") → type("Discord") → key("Return")
 - "click the X button" → screenshot → left_click at the button's coordinates
 - "open URL" → browser_action navigate (faster than screenshot clicking)
-- "message USER on Discord" → find Discord window → click it → key("ctrl+k") → type("USER") → key("Return") → type("message") → key("Return")
+- "switch to Discord" → focus_window("Discord") (NOT taskbar clicking)
+- "message USER on Discord" → focus_window("Discord") → key("ctrl+k") → type("USER") → key("Return") → type("message") → key("Return")
 
 Keep voice replies short. No narration — just actions.`;
 
@@ -97,6 +101,10 @@ class Agent {
     this.memory = new Memory();
     this._currentActions = [];
     this._lastToolType = null;
+    this._lastOCRMap = null;
+
+    // Preload tesseract WASM worker (non-blocking)
+    getWorker().catch(() => {});
 
     // Model switching state
     this._currentModel = MODEL_FAST;
@@ -135,6 +143,18 @@ class Agent {
             key: { type: 'string' },
           },
           required: ['action'],
+        },
+      },
+      // Focus a window by title (uses Win32 API — faster/more reliable than taskbar clicking)
+      {
+        name: 'focus_window',
+        description: 'Focus a desktop window by title pattern (regex). Use instead of clicking the taskbar. E.g. "Discord", "Chrome", "Notepad".',
+        input_schema: {
+          type: 'object',
+          properties: {
+            title_pattern: { type: 'string', description: 'Regex pattern to match window title (case-insensitive)' },
+          },
+          required: ['title_pattern'],
         },
       },
       // Safety confirmation
@@ -297,7 +317,7 @@ class Agent {
   async _runLoop() {
     let iterations = 0;
 
-    while (iterations < MAX_ITERATIONS) {
+    while (true) {
       iterations++;
       console.log(`[agent] --- Iteration ${iterations} (model: ${this._currentModel}) ---`);
       console.time(`[agent] iteration-${iterations}`);
@@ -420,6 +440,8 @@ class Agent {
       switch (name) {
         case 'browser_action':
           return await this._execBrowserAction(input);
+        case 'focus_window':
+          return await this._execFocusWindow(input);
         case 'request_confirmation':
           return await this._execConfirmation(input);
         default:
@@ -448,7 +470,7 @@ class Agent {
         this.blurOverlayFn();
         await this.computer.leftClick(px, py);
         await new Promise((r) => setTimeout(r, 100));
-        return await this._captureScreenshot();
+        return await this._captureScreenshot(false);
       }
 
       case 'right_click': {
@@ -457,7 +479,7 @@ class Agent {
         this.blurOverlayFn();
         await this.computer.rightClick(px, py);
         await new Promise((r) => setTimeout(r, 100));
-        return await this._captureScreenshot();
+        return await this._captureScreenshot(false);
       }
 
       case 'double_click': {
@@ -466,7 +488,7 @@ class Agent {
         this.blurOverlayFn();
         await this.computer.doubleClick(px, py);
         await new Promise((r) => setTimeout(r, 100));
-        return await this._captureScreenshot();
+        return await this._captureScreenshot(false);
       }
 
       case 'middle_click': {
@@ -475,14 +497,14 @@ class Agent {
         this.blurOverlayFn();
         await this.computer.middleClick(px, py);
         await new Promise((r) => setTimeout(r, 100));
-        return await this._captureScreenshot();
+        return await this._captureScreenshot(false);
       }
 
       case 'type': {
         console.log(`[type] "${(text || '').slice(0, 50)}${(text || '').length > 50 ? '...' : ''}"`);
         await this.computer.type(text);
         await new Promise((r) => setTimeout(r, 50));
-        return await this._captureScreenshot();
+        return await this._captureScreenshot(false);
       }
 
       case 'key': {
@@ -490,7 +512,7 @@ class Agent {
         console.log(`[key] "${text}" → "${normalized}"`);
         await this.computer.key(normalized);
         await new Promise((r) => setTimeout(r, 100));
-        return await this._captureScreenshot();
+        return await this._captureScreenshot(false);
       }
 
       case 'scroll': {
@@ -503,7 +525,7 @@ class Agent {
         console.log(`[scroll] ${dir} ${amount} at Physical(${px}, ${py})`);
         await this.computer.scroll(px, py, dir, amount);
         await new Promise((r) => setTimeout(r, 100));
-        return await this._captureScreenshot();
+        return await this._captureScreenshot(false);
       }
 
       case 'mouse_move': {
@@ -521,7 +543,7 @@ class Agent {
         this.blurOverlayFn();
         await this.computer.leftClickDrag(sx, sy, ex, ey);
         await new Promise((r) => setTimeout(r, 100));
-        return await this._captureScreenshot();
+        return await this._captureScreenshot(false);
       }
 
       default:
@@ -533,7 +555,7 @@ class Agent {
   // Screenshot capture (downscaled by screenshotFn)
   // =========================================================================
 
-  async _captureScreenshot() {
+  async _captureScreenshot(withOCR = true) {
     const ss = await this.screenshotFn();
     if (!ss || !ss.ok) {
       return [{ type: 'text', text: `Screenshot failed: ${ss?.error || 'unknown'}` }];
@@ -552,14 +574,40 @@ class Agent {
     }
     this._lastScreenshotHash = hash;
 
-    return [{
+    const imageBlock = {
       type: 'image',
       source: {
         type: 'base64',
         media_type: ss.mediaType || 'image/jpeg',
         data: ss.data,
       },
-    }];
+    };
+
+    // Run OCR on the same downscaled image Claude sees (coords already in display space)
+    // Skip OCR on action auto-screenshots (withOCR=false) to avoid 200-500ms+ per action
+    if (withOCR) {
+      try {
+        const buffer = Buffer.from(ss.data, 'base64');
+        const ocrMap = await buildOCRMap(buffer);
+        this._lastOCRMap = ocrMap;
+
+        const entries = Object.values(ocrMap)
+          .filter((e) => e.confidence > 60)
+          .sort((a, b) => b.confidence - a.confidence)
+          .slice(0, 30);
+
+        if (entries.length > 0) {
+          const labels = entries.map((e) =>
+            `"${e.raw}"@(${e.centerX},${e.centerY}) ${Math.round(e.confidence)}%`
+          ).join(', ');
+          return [imageBlock, { type: 'text', text: `[OCR: ${labels}]` }];
+        }
+      } catch (err) {
+        console.error('[agent] OCR failed (non-fatal):', err.message);
+      }
+    }
+
+    return [imageBlock];
   }
 
   // =========================================================================
@@ -584,6 +632,24 @@ class Agent {
   }
 
   // =========================================================================
+  // focus_window (Win32 API — faster than taskbar clicking)
+  // =========================================================================
+
+  async _execFocusWindow(input) {
+    if (!this.computer || typeof this.computer.focusWindow !== 'function') {
+      return [{ type: 'text', text: 'Focus window not available (no computer module).' }];
+    }
+    const result = await this.computer.focusWindow(input.title_pattern);
+    if (!result.ok) {
+      return [{ type: 'text', text: `Could not focus window: ${result.error}` }];
+    }
+    await new Promise((r) => setTimeout(r, 300));
+    const screenshot = await this._captureScreenshot(false);
+    screenshot.unshift({ type: 'text', text: `Focused: ${result.process} — "${result.title}"` });
+    return screenshot;
+  }
+
+  // =========================================================================
   // browser_action (CDP — kept for speed on web pages)
   // =========================================================================
 
@@ -603,6 +669,11 @@ class Agent {
           return [{ type: 'text', text: result.message }];
         }
       }
+    }
+
+    // Always bring browser to front so the user can see what's happening
+    if (typeof this.browser.bringBrowserToFront === 'function') {
+      await this.browser.bringBrowserToFront();
     }
 
     switch (action) {
@@ -788,6 +859,8 @@ class Agent {
         if (a === 'press_key') return `Pressing ${tu.input.key || '?'}...`;
         return `Browser: ${a}...`;
       }
+      case 'focus_window':
+        return `Focusing ${(tu.input?.title_pattern || '').slice(0, 30)}...`;
       case 'request_confirmation':
         return 'Asking for confirmation...';
       default:
