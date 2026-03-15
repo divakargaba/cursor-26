@@ -351,12 +351,15 @@ async function getCurrentPage() {
     console.log(`[browser] getCurrentPage: ${contexts.length} contexts, ${allPages.length} total pages`);
     if (!allPages.length) { page = null; return null; }
 
-    // If we already have a valid page reference, keep it
+    // If we already have a valid page reference AND it's still in the list, keep it.
+    // switchToTab explicitly sets `page`, so we respect that selection.
     if (page && allPages.includes(page)) {
       return page;
     }
 
-    // Pick the last page (most recently opened tab)
+    // No valid cached page — try to find the visible/active tab.
+    // Playwright doesn't expose "active tab" directly, so pick the last page
+    // (most recently opened/activated).
     page = allPages[allPages.length - 1];
     return page;
   } catch (err) {
@@ -370,32 +373,141 @@ async function getCurrentPage() {
 // Page context extraction (shared between Chrome and Electron apps)
 // ---------------------------------------------------------------------------
 
-function _extractElements(pageRef) {
+/**
+ * Extract rich page context from a Playwright page reference.
+ * Returns { elements, inputs, mainContent, selectedText, metadata, focusedElement }.
+ */
+function _extractRichContext(pageRef) {
   return pageRef.evaluate(() => {
-    const selector = [
+    // --- Visibility helper ---
+    function isVisible(el) {
+      if (!el) return false;
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    }
+
+    // --- 1. Interactive elements (prioritized, max 40) ---
+    const interactiveSelector = [
       'input', 'textarea', 'button', 'a', 'select',
-      '[role="button"]', '[role="link"]',
-      'h1', 'h2', 'h3', 'p', 'td', 'th',
-      'label', '[aria-label]',
+      '[role="button"]', '[role="link"]', '[role="menuitem"]',
+      '[role="tab"]', '[role="treeitem"]', '[role="option"]',
+      '[contenteditable="true"]', '[data-slate-editor]',
     ].join(', ');
-    const nodes = document.querySelectorAll(selector);
-    const results = [];
-    const MAX = 150;
-    for (let i = 0; i < nodes.length && results.length < MAX; i++) {
+    const nodes = document.querySelectorAll(interactiveSelector);
+    const focused = document.activeElement;
+    const elements = [];
+    const MAX_ELEMENTS = 40;
+
+    // Focused element first
+    if (focused && focused !== document.body && isVisible(focused)) {
+      const text = (focused.innerText || focused.value || focused.placeholder || focused.getAttribute('aria-label') || '').trim();
+      elements.push({
+        tag: focused.tagName.toLowerCase(),
+        text: text.length > 100 ? text.slice(0, 100) + '...' : text,
+        id: focused.id || null,
+        role: focused.getAttribute('role') || null,
+        type: focused.getAttribute('type') || null,
+        href: focused.tagName === 'A' ? focused.getAttribute('href') : null,
+        focused: true,
+      });
+    }
+
+    for (let i = 0; i < nodes.length && elements.length < MAX_ELEMENTS; i++) {
       const el = nodes[i];
-      if (el.offsetParent === null && el.tagName !== 'INPUT' && el.type !== 'hidden') continue;
+      if (el === focused) continue; // already added
+      if (!isVisible(el)) continue;
       const text = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').trim();
-      const truncated = text.length > 150 ? text.slice(0, 150) + '...' : text;
-      results.push({
+      elements.push({
         tag: el.tagName.toLowerCase(),
-        text: truncated,
+        text: text.length > 100 ? text.slice(0, 100) + '...' : text,
         id: el.id || null,
         role: el.getAttribute('role') || null,
         type: el.getAttribute('type') || null,
         href: el.tagName === 'A' ? el.getAttribute('href') : null,
       });
     }
-    return results;
+
+    // --- 2. Input fields with current values ---
+    const inputNodes = document.querySelectorAll('input, textarea, select, [contenteditable="true"], [data-slate-editor]');
+    const inputs = [];
+    for (let i = 0; i < inputNodes.length && inputs.length < 15; i++) {
+      const el = inputNodes[i];
+      if (!isVisible(el)) continue;
+      const tag = el.tagName.toLowerCase();
+      const type = el.getAttribute('type') || (tag === 'textarea' ? 'textarea' : tag === 'select' ? 'select' : null);
+      // Skip hidden/submit inputs
+      if (type === 'hidden' || type === 'submit') continue;
+      const value = (el.value || el.textContent || '').trim();
+      const label = el.getAttribute('aria-label')
+        || (el.labels && el.labels[0] ? el.labels[0].textContent.trim() : null)
+        || el.getAttribute('placeholder')
+        || el.getAttribute('name')
+        || el.id
+        || null;
+      inputs.push({
+        tag,
+        type,
+        id: el.id || null,
+        name: el.getAttribute('name') || null,
+        label,
+        placeholder: el.getAttribute('placeholder') || null,
+        value: value.length > 80 ? value.slice(0, 80) + '...' : value,
+        focused: el === focused,
+      });
+    }
+
+    // --- 3. Main page content ---
+    let mainContent = null;
+    // Try common content containers
+    const contentSelectors = [
+      'article', 'main', '[role="main"]',
+      '.post-content', '.article-body', '.email-body',
+      '.message-content', '.chat-messages',
+    ];
+    for (const sel of contentSelectors) {
+      const el = document.querySelector(sel);
+      if (el && isVisible(el)) {
+        const text = (el.innerText || '').trim();
+        if (text.length > 50) {
+          mainContent = text.length > 2000 ? text.slice(0, 2000) + '...' : text;
+          break;
+        }
+      }
+    }
+    // Fallback: body text (truncated)
+    if (!mainContent) {
+      const bodyText = (document.body.innerText || '').trim();
+      if (bodyText.length > 100) {
+        mainContent = bodyText.length > 2000 ? bodyText.slice(0, 2000) + '...' : bodyText;
+      }
+    }
+
+    // --- 4. Selected text ---
+    const selection = window.getSelection();
+    const selectedText = selection && selection.toString().trim() ? selection.toString().trim() : null;
+
+    // --- 5. Focused element description ---
+    let focusedElement = null;
+    if (focused && focused !== document.body && isVisible(focused)) {
+      const tag = focused.tagName.toLowerCase();
+      const label = focused.getAttribute('aria-label') || focused.getAttribute('placeholder') || focused.id || tag;
+      focusedElement = `${tag}[${label}]`;
+    }
+
+    // --- 6. Page metadata ---
+    const url = window.location.href;
+    let domain;
+    try { domain = new URL(url).hostname; } catch { domain = 'unknown'; }
+    const metadata = {
+      url,
+      domain,
+      formCount: document.forms.length,
+      title: document.title,
+    };
+
+    return { elements, inputs, mainContent, selectedText, focusedElement, metadata };
   });
 }
 
@@ -406,8 +518,18 @@ async function getPageContext() {
     const url = page.url();
     const title = await page.title();
     console.log(`[browser] getPageContext → tab: ${url.slice(0, 80)} — "${title.slice(0, 50)}"`);
-    const elements = await _extractElements(page);
-    return { url, title, elements };
+
+    const rich = await _extractRichContext(page);
+    return {
+      url,
+      title,
+      elements: rich.elements || [],
+      inputs: rich.inputs || [],
+      mainContent: rich.mainContent || null,
+      selectedText: rich.selectedText || null,
+      focusedElement: rich.focusedElement || null,
+      metadata: rich.metadata || { domain: 'unknown' },
+    };
   } catch (err) {
     console.error('[browser] getPageContext error:', err.message);
     return null;
@@ -544,8 +666,16 @@ async function getAppPageContext(appName) {
 
     const url = mainPage.url();
     const title = await mainPage.title();
-    const elements = await _extractElements(mainPage);
-    return { url, title, elements, appName };
+    const rich = await _extractRichContext(mainPage);
+    return {
+      url, title, appName,
+      elements: rich.elements || [],
+      inputs: rich.inputs || [],
+      mainContent: rich.mainContent || null,
+      selectedText: rich.selectedText || null,
+      focusedElement: rich.focusedElement || null,
+      metadata: rich.metadata || { domain: 'unknown' },
+    };
   } catch (err) {
     console.error(`[browser] getAppPageContext(${appName}) error:`, err.message);
     // Connection might be dead — clean up
@@ -661,13 +791,51 @@ async function cdpClick(selector) {
   try {
     await getCurrentPage();
     if (!page) return { ok: false, error: 'No page available' };
+
+    // Attempt 1: direct selector click
     try {
-      await page.click(selector, { timeout: 2000 });
-    } catch {
-      // Fallback: force click bypasses visibility/actionability checks
-      await page.click(selector, { timeout: 2000, force: true });
+      await page.click(selector, { timeout: 3000 });
+      return { ok: true };
+    } catch (selectorError) {
+      console.log(`[browser] click_selector failed for "${selector}", trying fallbacks...`);
+
+      // Fallback 1: Try finding by visible text if the element has text content
+      try {
+        const textContent = await page.evaluate((sel) => {
+          const el = document.querySelector(sel);
+          return el?.textContent?.trim();
+        }, selector);
+
+        if (textContent) {
+          await page.click(`text="${textContent}"`, { timeout: 3000 });
+          console.log(`[browser] fallback_text worked for "${selector}"`);
+          return { ok: true, method: 'fallback_text' };
+        }
+      } catch { /* text fallback failed */ }
+
+      // Fallback 2: If selector was an ID, try by attribute
+      try {
+        if (selector.startsWith('#')) {
+          const id = selector.slice(1);
+          await page.click(`[id="${id}"]`, { timeout: 3000 });
+          console.log(`[browser] fallback_attribute worked for "${selector}"`);
+          return { ok: true, method: 'fallback_attribute' };
+        }
+      } catch { /* attribute fallback failed */ }
+
+      // Fallback 3: Force click bypasses actionability checks
+      try {
+        await page.click(selector, { timeout: 2000, force: true });
+        console.log(`[browser] force_click worked for "${selector}"`);
+        return { ok: true, method: 'force_click' };
+      } catch { /* force click also failed */ }
+
+      // All fallbacks failed
+      return {
+        ok: false,
+        error: `Could not click "${selector}". Element may not exist, may be hidden, or may have changed. Suggestion: use read_page to refresh the element list, or try click_text with the visible label.`,
+      };
     }
-    return { ok: true };
   } catch (err) {
     console.error('[browser] cdpClick error:', err.message);
     return { ok: false, error: err.message };

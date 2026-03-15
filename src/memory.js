@@ -174,6 +174,18 @@ class Memory {
       .slice(0, 5);
   }
 
+  /**
+   * Get recent failures for an app (within the last hour).
+   * Used for injecting known-issue context into agent prompts.
+   */
+  getRecentFailures(app, limit = 3) {
+    const now = Date.now();
+    const oneHour = 3600000;
+    return this.failures
+      .filter(f => f.app === (app || '').toLowerCase() && (now - f.timestamp) < oneHour)
+      .slice(-limit);
+  }
+
   // ===========================================================================
   // PREFERENCES — learned user behavior patterns
   // ===========================================================================

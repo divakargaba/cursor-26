@@ -3,7 +3,7 @@ require('dotenv').config();
 const Anthropic = require('@anthropic-ai/sdk');
 const crypto = require('crypto');
 
-const MODEL = 'claude-sonnet-4-6';
+const MODEL = 'claude-sonnet-4-5-20250929';
 const MAX_ACTIONS = 12;
 const MAX_HISTORY = 20;
 

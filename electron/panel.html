@@ -1024,13 +1024,16 @@ function setOrbState(state) {
 
 function speak(text) {
   if(!ttsEnabled||!window.speechSynthesis)return;
+  if(!text||!text.trim())return;
   window.speechSynthesis.cancel();
   const u=new SpeechSynthesisUtterance(text);u.rate=1.1;u.pitch=1.0;u.volume=1.0;
   const v=window.speechSynthesis.getVoices();
-  const pref=v.find(v=>v.name.includes('Microsoft Zira')||v.name.includes('Microsoft David')||v.name.includes('Google'));
+  // macOS: Samantha, Alex; Windows: Zira, David; Chrome: Google voices
+  const pref=v.find(v=>v.name.includes('Samantha'))||v.find(v=>v.name.includes('Alex'))||v.find(v=>v.name.includes('Microsoft Zira')||v.name.includes('Microsoft David')||v.name.includes('Google'));
   if(pref)u.voice=pref;
   u.onstart=()=>setOrbState('speaking');
   u.onend=()=>setOrbState('idle');
+  u.onerror=(e)=>{console.error('[tts] error:',e.error);setOrbState('idle');};
   window.speechSynthesis.speak(u);
 }
 
@@ -1122,14 +1125,18 @@ function hideActionPreview(){
   riskBadge.style.display='none';currentActionId=null;messagesWrapper.classList.remove('dimmed');
 }
 
+let _sending = false;
 async function sendMessage(text){
   if(!text||!text.trim())return;text=text.trim();
+  if(_sending){console.log('[panel] Already sending, queued');return;}
+  _sending=true;
   addMessage('user',text);showTyping();setOrbState('thinking');
   try{
     const r=await window.aiAssistant.sendMessage(text);hideTyping();window.aiAssistant.showPanel();
     if(r.ok){addMessage('assistant',r.reply.text);speak(r.reply.text);if(r.reply.actionPreview)showActionPreview(r.reply.actionPreview);}
     else{setOrbState('idle');addMessage('assistant','Something went wrong. Try again.');speak('Something went wrong. Try again.');}
   }catch(e){hideTyping();setOrbState('idle');addMessage('assistant','Connection error. Is the app running?');}
+  finally{_sending=false;setOrbState('idle');}
 }
 async function confirmAction(){if(!currentActionId)return;const id=currentActionId;hideActionPreview();await window.aiAssistant.confirmAction(id);}
 function cancelConfirmation(){if(!currentActionId)return;const id=currentActionId;hideActionPreview();window.aiAssistant.cancelAction(id);}
@@ -1142,8 +1149,9 @@ function clearChat(){
     renderSuggestions(currentSuggestions, suggestionsEmptyEl);
   }
 }
-function startAutoClose(){clearAutoClose();if(isPinned||currentActionId)return;autoCloseTimer=setTimeout(()=>window.aiAssistant.hideOverlay(),8000);}
-function clearAutoClose(){if(autoCloseTimer){clearTimeout(autoCloseTimer);autoCloseTimer=null;}}
+// Auto-close disabled — window should always stay visible
+function startAutoClose(){}
+function clearAutoClose(){}
 
 let resizeRaf=null;
 function autoResize(){if(resizeRaf)return;resizeRaf=requestAnimationFrame(()=>{textInput.style.height='auto';textInput.style.height=Math.min(textInput.scrollHeight,72)+'px';resizeRaf=null;});}

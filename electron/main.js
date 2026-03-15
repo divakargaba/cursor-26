@@ -53,6 +53,7 @@ let calibration = null;
 let suggestionEngine = null;
 let displayConfig = null;
 let isQuitting = false;
+let agentRunning = false;
 
 // Single instance lock
 const gotLock = app.requestSingleInstanceLock();
@@ -60,9 +61,7 @@ if (!gotLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (mb && mb.window) {
-      mb.showWindow();
-    }
+    showAssistantWindow();
   });
 }
 
@@ -234,10 +233,36 @@ async function captureScreen() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Window show/hide — single source of truth (bypasses menubar's state)
+// ---------------------------------------------------------------------------
+
+function showAssistantWindow() {
+  if (!mb || !mb.window || mb.window.isDestroyed()) return;
+  mb.window.show();
+  console.log('[window] show');
+}
+
+function hideAssistantWindow() {
+  if (!mb || !mb.window || mb.window.isDestroyed()) return;
+  mb.window.hide();
+  console.log('[window] hide');
+  // Reset to orb mode
+  sendToRenderer('focus-lost');
+  sendToRenderer('panel-reset');
+  const bounds = mb.window.getBounds();
+  if (bounds.width !== ORB_WINDOW_W || bounds.height !== ORB_WINDOW_H) {
+    const cx = bounds.x + Math.round(bounds.width / 2);
+    const newX = Math.round(cx - ORB_WINDOW_W / 2);
+    mb.window.setBounds({ x: newX, y: bounds.y, width: ORB_WINDOW_W, height: ORB_WINDOW_H });
+  }
+}
+
 // --- IPC Handlers ---
 
 ipcMain.handle('send-message', async (_event, { text }) => {
   try {
+    agentRunning = true;
     if (suggestionEngine) suggestionEngine.agentBusy = true;
     const reply = await agent.chat(text);
     if (suggestionEngine) { suggestionEngine.agentBusy = false; suggestionEngine.clearCache(); }
@@ -246,6 +271,8 @@ ipcMain.handle('send-message', async (_event, { text }) => {
     if (suggestionEngine) suggestionEngine.agentBusy = false;
     console.error('Agent error:', err);
     return { ok: false, error: err.message };
+  } finally {
+    agentRunning = false;
   }
 });
 
@@ -255,7 +282,7 @@ ipcMain.on('use-suggestion', async (_event, text) => {
 });
 
 ipcMain.on('hide-overlay', () => {
-  if (mb) mb.hideWindow();
+  hideAssistantWindow();
 });
 
 ipcMain.on('clear-history', () => {
@@ -263,9 +290,9 @@ ipcMain.on('clear-history', () => {
 });
 
 ipcMain.on('show-panel', () => {
-  // showInactive — NEVER steal focus from the target app
+  // showInactive — keep visible but don't steal focus from target app
   if (mb && mb.window && !mb.window.isDestroyed()) {
-    mb.window.showInactive();
+    if (!mb.window.isVisible()) mb.window.showInactive();
   }
 });
 
@@ -274,9 +301,10 @@ ipcMain.on('set-tray-state', (_event, state) => {
 });
 
 // Blur overlay — release focus so keystrokes land in target app
+// Note: we just lower z-order, don't call blur() which could re-trigger issues
 ipcMain.on('blur-overlay', () => {
   if (mb && mb.window && !mb.window.isDestroyed()) {
-    mb.window.blur();
+    mb.window.setAlwaysOnTop(false);
   }
 });
 
@@ -394,6 +422,36 @@ app.whenReady().then(async () => {
     },
   });
 
+  // -----------------------------------------------------------------------
+  // Take over window management from menubar.
+  // The menubar library tracks _isVisible internally and auto-hides on blur.
+  // This causes state desync because we also show/hide the window directly.
+  // Fix: remove menubar's blur listener + tray click handler, manage ourselves.
+  // -----------------------------------------------------------------------
+
+  mb.on('after-create-window', () => {
+    if (!mb.window) return;
+
+    // 1. Kill menubar's blur → auto-hide behavior
+    mb.window.removeAllListeners('blur');
+
+    // 2. Take over tray click — use Electron's isVisible(), not menubar's _isVisible
+    if (mb.tray) {
+      mb.tray.removeAllListeners('click');
+      mb.tray.removeAllListeners('double-click');
+      mb.tray.on('click', () => {
+        if (!mb.window || mb.window.isDestroyed()) return;
+        if (mb.window.isVisible()) {
+          hideAssistantWindow();
+        } else {
+          showAssistantWindow();
+        }
+      });
+    }
+
+    console.log('[startup] Window management: took over from menubar (no auto-hide)');
+  });
+
   mb.on('ready', async () => {
     console.log('[startup] Tray app ready');
 
@@ -427,18 +485,13 @@ app.whenReady().then(async () => {
       screenshotFn: captureScreen,
       displayConfig,
       blurOverlayFn: () => {
-        if (mb.window && !mb.window.isDestroyed()) {
-          mb.window.hide();
-        }
-      },
-      hideOverlayFn: () => {
-        if (mb.window && !mb.window.isDestroyed()) {
-          mb.hideWindow();
+        // Lower z-order so the target app is in front, but keep window visible
+        if (mb && mb.window && !mb.window.isDestroyed()) {
+          mb.window.setAlwaysOnTop(false);
         }
       },
       showOverlayFn: () => {
         if (mb && mb.window && !mb.window.isDestroyed()) {
-          mb.showWindow();
           mb.window.showInactive();
         }
       },
@@ -468,21 +521,9 @@ app.whenReady().then(async () => {
     globalShortcut.register('Ctrl+Shift+Space', () => {
       sendToRenderer('start-listening');
     });
-  });
 
-  // On hide: reset to orb mode and collapse window
-  mb.on('hide', () => {
-    sendToRenderer('focus-lost');
-    sendToRenderer('panel-reset');
-    // Collapse window back to orb size
-    if (mb.window && !mb.window.isDestroyed()) {
-      const bounds = mb.window.getBounds();
-      if (bounds.width !== ORB_WINDOW_W || bounds.height !== ORB_WINDOW_H) {
-        const cx = bounds.x + Math.round(bounds.width / 2);
-        const newX = Math.round(cx - ORB_WINDOW_W / 2);
-        mb.window.setBounds({ x: newX, y: bounds.y, width: ORB_WINDOW_W, height: ORB_WINDOW_H });
-      }
-    }
+    // Show the window on startup
+    showAssistantWindow();
   });
 });
 
