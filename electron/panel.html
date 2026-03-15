@@ -41,18 +41,22 @@
      ═══════════════════════════════════════════════════════ */
   #orb-stage {
     position:absolute; top:0; left:0; width:100%; height:100%;
-    display:flex; align-items:center; justify-content:center;
+    display:flex; flex-direction:column; align-items:center; justify-content:flex-start;
     z-index:10; background:transparent;
-    -webkit-app-region:drag;
   }
+  #orb-container {
+    position:relative; width:100%; height:200px;
+    display:flex; align-items:center; justify-content:center;
+    flex-shrink:0; cursor:grab;
+  }
+  #orb-container:active { cursor:grabbing; }
   #orb-stage.hidden { display:none; }
   #orb-hero-canvas {
     width:110px; height:110px;
-    cursor:grab; position:relative; z-index:2;
+    cursor:inherit; position:relative; z-index:2;
     background:transparent; border:none;
-    -webkit-app-region:drag;
+    -webkit-app-region:no-drag;
   }
-  #orb-hero-canvas:active { cursor:grabbing; }
   #orb-bg-glow {
     position:absolute; width:220px; height:220px;
     border-radius:50%; pointer-events:none; z-index:1;
@@ -309,15 +313,113 @@
     padding:5px 14px; border-radius:6px; opacity:0; pointer-events:none;
     z-index:100; box-shadow:0 4px 20px rgba(0,0,0,0.4);
   }
+
+  /* ═══ Suggestion Chips ═══ */
+  #suggestions-orb {
+    display:flex; flex-direction:column; align-items:center; gap:6px;
+    position:relative; z-index:2; margin-top:4px;
+    width:100%; padding:0 10px; box-sizing:border-box;
+    pointer-events:auto; -webkit-app-region:no-drag;
+    max-height:110px; overflow-y:auto;
+    scrollbar-width:none;
+  }
+  #suggestions-orb::-webkit-scrollbar { display:none; }
+  #suggestions-orb:empty { display:none; }
+  #suggestions-panel {
+    display:flex; flex-direction:column; gap:6px; padding:8px 16px;
+    align-items:flex-start; max-height:120px; overflow-y:auto;
+    flex-shrink:0; position:relative; z-index:2;
+    scrollbar-width:none;
+  }
+  #suggestions-panel::-webkit-scrollbar { display:none; }
+  #suggestions-panel:empty { display:none; }
+  .suggestion-chip {
+    display:inline-flex; align-items:flex-start; gap:6px;
+    padding:6px 14px; border-radius:16px;
+    background:rgba(124,106,239,0.06);
+    border:1px solid rgba(124,106,239,0.12);
+    color:var(--text-secondary); font-size:12px; font-family:'Outfit',sans-serif;
+    font-weight:400; cursor:pointer; text-align:left;
+    width:fit-content; max-width:calc(100% - 32px);
+    transition:all 200ms ease; flex-shrink:0; outline:none;
+  }
+  .suggestion-chip span {
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+    overflow:hidden; line-height:1.4;
+  }
+  .suggestion-chip:hover {
+    background:rgba(124,106,239,0.12);
+    border-color:rgba(124,106,239,0.25);
+    color:var(--text-primary);
+    transform:translateY(-1px);
+    box-shadow:0 2px 12px rgba(124,106,239,0.1);
+  }
+  .suggestion-chip:active {
+    transform:translateY(0) scale(0.97);
+    background:rgba(124,106,239,0.18);
+  }
+  .suggestion-chip svg {
+    width:12px; height:12px; flex-shrink:0;
+    fill:none; stroke:currentColor; stroke-width:1.5;
+    stroke-linecap:round; stroke-linejoin:round;
+  }
+  /* Orb mode: stronger opaque backgrounds for readability over desktop */
+  #suggestions-orb .suggestion-chip {
+    font-size:13px; padding:8px 16px;
+    background:rgba(15,15,24,0.85);
+    border:1px solid rgba(124,106,239,0.2);
+    backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
+    box-shadow:0 4px 16px rgba(0,0,0,0.3);
+    color:var(--text-primary);
+    max-width:calc(100% - 20px);
+  }
+  #suggestions-orb .suggestion-chip:hover {
+    background:rgba(124,106,239,0.25);
+    border-color:rgba(124,106,239,0.4);
+    box-shadow:0 4px 20px rgba(124,106,239,0.15);
+  }
+  .suggestions-dimmed { opacity:0.3; pointer-events:none; transition:opacity 0.4s ease; }
+
+  /* ═══ Empty State ═══ */
+  #empty-state {
+    position:absolute; top:0; left:0; width:100%; height:100%;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:16px; padding:20px; z-index:2;
+  }
+  #empty-state .greeting {
+    color:var(--text-secondary); font-family:'Outfit',sans-serif;
+    font-weight:300; font-size:15px;
+  }
+  #empty-state #suggestions-empty {
+    display:flex; flex-direction:column; gap:6px; align-items:center;
+    width:100%;
+  }
+  #empty-state #suggestions-empty:empty { display:none; }
+
+  /* ═══ Orb Drag Feedback ═══ */
+  #orb-container.dragging {
+    filter:drop-shadow(0 8px 24px rgba(124,106,239,0.3));
+  }
+
+  .suggestion-skeleton {
+    display:inline-block; height:30px; border-radius:20px;
+    background:linear-gradient(90deg, rgba(124,106,239,0.04) 25%, rgba(124,106,239,0.08) 50%, rgba(124,106,239,0.04) 75%);
+    background-size:200% 100%; animation:shimmer 1.5s infinite;
+    border:1px solid rgba(124,106,239,0.06); flex-shrink:0;
+  }
+  @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
 </style>
 </head>
 <body>
 
 <!-- ═══ STAGE 1: ORB ONLY ═══ -->
 <div id="orb-stage">
-  <div id="orb-bg-gradient"></div>
-  <div id="orb-bg-glow"></div>
-  <canvas id="orb-hero-canvas"></canvas>
+  <div id="orb-container">
+    <div id="orb-bg-gradient"></div>
+    <div id="orb-bg-glow"></div>
+    <canvas id="orb-hero-canvas"></canvas>
+  </div>
+  <div id="suggestions-orb"></div>
 </div>
 
 <!-- ═══ STAGE 2: FULL PANEL ═══ -->
@@ -346,6 +448,10 @@
     </div>
 
     <div id="messages-wrapper">
+      <div id="empty-state">
+        <span class="greeting">What can I help with?</span>
+        <div id="suggestions-empty"></div>
+      </div>
       <div id="messages"></div>
     </div>
 
@@ -370,6 +476,8 @@
         </div>
       </div>
     </div>
+
+    <div id="suggestions-panel"></div>
 
     <div id="input-area">
       <div id="input-bar">
@@ -742,15 +850,47 @@ function resetToOrb() {
   gsap.set(heroCanvas, { scale:1 });
 }
 
-// Click vs drag: expand panel only on short clicks (not drags)
-let _orbDown = null;
-heroCanvas.addEventListener('mousedown', (e) => { _orbDown = { x:e.screenX, y:e.screenY, t:Date.now() }; });
-heroCanvas.addEventListener('mouseup', (e) => {
-  if (!_orbDown) return;
-  const dx = Math.abs(e.screenX - _orbDown.x), dy = Math.abs(e.screenY - _orbDown.y);
-  const dt = Date.now() - _orbDown.t;
-  _orbDown = null;
-  if (dx < 5 && dy < 5 && dt < 300) expandToPanel();
+// Orb dragging (manual IPC-based window move) + click-to-expand
+let _isDragging = false;
+let _dragStartX = 0, _dragStartY = 0;
+let _hasDragged = false;
+const DRAG_THRESHOLD = 5;
+const orbContainer = document.getElementById('orb-container');
+
+orbContainer.addEventListener('mousedown', (e) => {
+  if (panelMode !== 'orb') return;
+  _isDragging = true;
+  _hasDragged = false;
+  _dragStartX = e.screenX;
+  _dragStartY = e.screenY;
+  orbContainer.classList.add('dragging');
+  e.preventDefault();
+});
+
+document.addEventListener('mousemove', (e) => {
+  if (!_isDragging) return;
+  const deltaX = e.screenX - _dragStartX;
+  const deltaY = e.screenY - _dragStartY;
+  if (Math.abs(deltaX) > DRAG_THRESHOLD || Math.abs(deltaY) > DRAG_THRESHOLD) {
+    _hasDragged = true;
+  }
+  if (_hasDragged) {
+    window.aiAssistant.moveWindow(deltaX, deltaY);
+    _dragStartX = e.screenX;
+    _dragStartY = e.screenY;
+  }
+});
+
+document.addEventListener('mouseup', (e) => {
+  if (_isDragging) {
+    orbContainer.classList.remove('dragging');
+    if (!_hasDragged) {
+      // Click, not drag — expand to panel
+      expandToPanel();
+    }
+    _isDragging = false;
+    _hasDragged = false;
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -912,6 +1052,17 @@ function addMessage(role,text){
   // Auto-expand if in orb mode
   if (panelMode === 'orb') expandToPanel();
 
+  // Hide empty state on first message
+  if (!hasMessages) {
+    hasMessages = true;
+    emptyStateEl.style.display = 'none';
+    suggestionsEmptyEl.innerHTML = '';
+    // Move suggestions to panel position
+    if (currentSuggestions.length > 0) {
+      renderSuggestions(currentSuggestions, suggestionsPanelEl);
+    }
+  }
+
   if(role==='assistant'&&isSystemMessage(text)){
     const s=document.createElement('div');s.className='system-msg';
     s.innerHTML=`<span class="system-msg-text"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="7"/><line x1="8" y1="5" x2="8" y2="8.5"/><circle cx="8" cy="11" r="0.5" fill="currentColor"/></svg>${text}</span>`;
@@ -984,6 +1135,12 @@ async function confirmAction(){if(!currentActionId)return;const id=currentAction
 function cancelConfirmation(){if(!currentActionId)return;const id=currentActionId;hideActionPreview();window.aiAssistant.cancelAction(id);}
 function clearChat(){
   messagesEl.innerHTML='';hideActionPreview();window.aiAssistant.clearHistory();
+  hasMessages = false;
+  emptyStateEl.style.display = '';
+  if (currentSuggestions.length > 0) {
+    suggestionsPanelEl.innerHTML = '';
+    renderSuggestions(currentSuggestions, suggestionsEmptyEl);
+  }
 }
 function startAutoClose(){clearAutoClose();if(isPinned||currentActionId)return;autoCloseTimer=setTimeout(()=>window.aiAssistant.hideOverlay(),8000);}
 function clearAutoClose(){if(autoCloseTimer){clearTimeout(autoCloseTimer);autoCloseTimer=null;}}
@@ -1060,6 +1217,135 @@ const observer = new MutationObserver(() => {
   }
 });
 observer.observe(panelStageEl, { attributes:true, attributeFilter:['class'] });
+
+// ═══════════════════════════════════════════════════════════════
+// SUGGESTION CHIPS + EMPTY STATE
+// ═══════════════════════════════════════════════════════════════
+const suggestionsOrbEl = document.getElementById('suggestions-orb');
+const suggestionsPanelEl = document.getElementById('suggestions-panel');
+const suggestionsEmptyEl = document.getElementById('suggestions-empty');
+const emptyStateEl = document.getElementById('empty-state');
+let currentSuggestions = [];
+let hasMessages = false;
+
+function getSuggestionIcon(text) {
+  const t = text.toLowerCase();
+  if (t.includes('email') || t.includes('message') || t.includes('reply') || t.includes('send') || t.includes('chat'))
+    return '<svg viewBox="0 0 16 16"><rect x="2" y="4" width="12" height="8" rx="1"/><path d="M2 4l6 4 6-4"/></svg>';
+  if (t.includes('code') || t.includes('fix') || t.includes('lint') || t.includes('debug') || t.includes('error') || t.includes('bug'))
+    return '<svg viewBox="0 0 16 16"><polyline points="5 4 2 8 5 12"/><polyline points="11 4 14 8 11 12"/></svg>';
+  if (t.includes('summarize') || t.includes('organize') || t.includes('clean') || t.includes('archive') || t.includes('sort'))
+    return '<svg viewBox="0 0 16 16"><path d="M8 2l1.5 3 3.5.5-2.5 2.5.5 3.5L8 10l-3 1.5.5-3.5L3 5.5 6.5 5z"/></svg>';
+  if (t.includes('search') || t.includes('find') || t.includes('look'))
+    return '<svg viewBox="0 0 16 16"><circle cx="7" cy="7" r="4"/><line x1="10" y1="10" x2="14" y2="14"/></svg>';
+  if (t.includes('draft') || t.includes('write') || t.includes('compose'))
+    return '<svg viewBox="0 0 16 16"><path d="M11.5 1.5l3 3L5 14H2v-3z"/></svg>';
+  // Default: lightning bolt
+  return '<svg viewBox="0 0 16 16"><path d="M9 1L4 9h4l-1 6 5-8H8l1-6z"/></svg>';
+}
+
+function _addChips(suggestions, container) {
+  suggestions.forEach((text, i) => {
+    const chip = document.createElement('button');
+    chip.className = 'suggestion-chip';
+    chip.innerHTML = getSuggestionIcon(text) + '<span>' + text + '</span>';
+    chip.addEventListener('click', () => _useSuggestion(text, chip, container));
+    container.appendChild(chip);
+    gsap.fromTo(chip, { opacity:0, y:8 }, { opacity:1, y:0, duration:0.25, delay:i * 0.08, ease:'power2.out' });
+  });
+}
+
+function renderSuggestions(suggestions, container) {
+  const existing = container.querySelectorAll('.suggestion-chip, .suggestion-skeleton');
+  if (existing.length > 0) {
+    gsap.to(existing, {
+      opacity:0, y:4, duration:0.15, stagger:0.03,
+      onComplete: () => {
+        container.innerHTML = '';
+        if (suggestions.length > 0) setTimeout(() => _addChips(suggestions, container), 100);
+      },
+    });
+  } else {
+    container.innerHTML = '';
+    if (suggestions.length > 0) _addChips(suggestions, container);
+  }
+}
+
+function _useSuggestion(text, chip, container) {
+  // Flash the tapped chip
+  gsap.to(chip, { background:'rgba(124,106,239,0.25)', duration:0.1, onComplete: () => {
+    gsap.to(container.querySelectorAll('.suggestion-chip'), {
+      opacity:0, y:4, duration:0.15, stagger:0.03,
+      onComplete: () => { container.innerHTML = ''; },
+    });
+  }});
+  // Send as user message through normal flow
+  window.aiAssistant.useSuggestion(text);
+  sendMessage(text);
+}
+
+function updateSuggestions(suggestions) {
+  currentSuggestions = suggestions;
+  if (panelMode === 'orb') {
+    renderSuggestions(suggestions, suggestionsOrbEl);
+    suggestionsPanelEl.innerHTML = '';
+    suggestionsEmptyEl.innerHTML = '';
+  } else if (!hasMessages) {
+    // Empty state: show in center
+    renderSuggestions(suggestions, suggestionsEmptyEl);
+    suggestionsPanelEl.innerHTML = '';
+    suggestionsOrbEl.innerHTML = '';
+  } else {
+    renderSuggestions(suggestions, suggestionsPanelEl);
+    suggestionsOrbEl.innerHTML = '';
+    suggestionsEmptyEl.innerHTML = '';
+  }
+}
+
+function setSuggestionsDimmed(dimmed) {
+  suggestionsOrbEl.classList.toggle('suggestions-dimmed', dimmed);
+  suggestionsPanelEl.classList.toggle('suggestions-dimmed', dimmed);
+}
+
+// Dim suggestions when agent is active
+const _origSetOrbState = setOrbState;
+setOrbState = function(state) {
+  _origSetOrbState(state);
+  const busy = (state === 'listening' || state === 'thinking' || state === 'speaking');
+  setSuggestionsDimmed(busy);
+};
+
+// When panel mode switches, move suggestions to the right container
+const _origExpandToPanel = expandToPanel;
+expandToPanel = function() {
+  _origExpandToPanel();
+  suggestionsOrbEl.innerHTML = '';
+  if (currentSuggestions.length > 0) {
+    if (!hasMessages) {
+      // Show in empty state center
+      renderSuggestions(currentSuggestions, suggestionsEmptyEl);
+    } else {
+      renderSuggestions(currentSuggestions, suggestionsPanelEl);
+    }
+  }
+};
+
+const _origResetToOrb = resetToOrb;
+resetToOrb = function() {
+  _origResetToOrb();
+  suggestionsPanelEl.innerHTML = '';
+  suggestionsEmptyEl.innerHTML = '';
+  // Reset empty state visibility
+  hasMessages = false;
+  emptyStateEl.style.display = '';
+  messagesEl.innerHTML = '';
+  if (currentSuggestions.length > 0) {
+    renderSuggestions(currentSuggestions, suggestionsOrbEl);
+  }
+};
+
+// IPC handler for suggestions
+window.aiAssistant.onSuggestionsUpdate(suggestions => updateSuggestions(suggestions));
 </script>
 </body>
 </html>

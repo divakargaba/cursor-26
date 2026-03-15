@@ -60,4 +60,17 @@ contextBridge.exposeInMainWorld('aiAssistant', {
   onPanelReset: (callback) => {
     ipcRenderer.on('panel-reset', () => callback());
   },
+
+  useSuggestion: (text) =>
+    ipcRenderer.send('use-suggestion', text),
+
+  onSuggestionsUpdate: (callback) => {
+    ipcRenderer.on('suggestions-update', (_event, suggestions) => callback(suggestions));
+  },
+
+  moveWindow: (deltaX, deltaY) =>
+    ipcRenderer.send('move-window', deltaX, deltaY),
+
+  getWindowPosition: () =>
+    ipcRenderer.sendSync('get-window-position'),
 });

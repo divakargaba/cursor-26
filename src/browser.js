@@ -562,6 +562,35 @@ async function getAppPageContext(appName) {
  * List all open tabs (pages) in the Chrome browser context.
  * Returns [{ url, title, index }] or empty array.
  */
+/**
+ * Get all tab URLs without awaiting .title() (which can hang on some pages).
+ * Returns array of { url } objects synchronously from Playwright's page cache.
+ */
+function getTabUrls() {
+  try {
+    if (!browser || !browser.isConnected()) return [];
+    const contexts = browser.contexts();
+    if (!contexts.length) return [];
+    const results = [];
+    for (const ctx of contexts) {
+      for (const p of ctx.pages()) {
+        try {
+          const url = p.url();
+          if (url && !url.startsWith('chrome://') &&
+              !url.startsWith('chrome-extension://') &&
+              !url.startsWith('devtools://') &&
+              url !== 'about:blank') {
+            results.push({ url });
+          }
+        } catch { /* skip */ }
+      }
+    }
+    return results;
+  } catch {
+    return [];
+  }
+}
+
 async function listTabs() {
   try {
     if (!browser || !browser.isConnected()) return [];
@@ -785,6 +814,7 @@ module.exports = {
   detectCurrentApp,
   getAppPageContext,
   // Tab management
+  getTabUrls,
   listTabs,
   switchToTab,
   // Browser actions

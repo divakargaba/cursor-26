@@ -35,8 +35,10 @@ const Agent = require('../src/agent');
 const Computer = require('../src/computer');
 const browser = require('../src/browser');
 const { loadCalibration, runCalibration, validateCalibration } = require('../src/calibration');
+const SuggestionEngine = require('../src/suggestions');
 
-const ORB_WINDOW_SIZE = 200;
+const ORB_WINDOW_W = 220;
+const ORB_WINDOW_H = 310;
 const PANEL_WIDTH = 360;
 const PANEL_HEIGHT = 480;
 
@@ -44,6 +46,7 @@ let mb = null;
 let agent = null;
 let computer = null;
 let calibration = null;
+let suggestionEngine = null;
 let isQuitting = false;
 
 // Single instance lock
@@ -200,12 +203,20 @@ async function captureScreen() {
 
 ipcMain.handle('send-message', async (_event, { text }) => {
   try {
+    if (suggestionEngine) suggestionEngine.agentBusy = true;
     const reply = await agent.chat(text);
+    if (suggestionEngine) { suggestionEngine.agentBusy = false; suggestionEngine.clearCache(); }
     return { ok: true, reply };
   } catch (err) {
+    if (suggestionEngine) suggestionEngine.agentBusy = false;
     console.error('Agent error:', err);
     return { ok: false, error: err.message };
   }
+});
+
+ipcMain.on('use-suggestion', async (_event, text) => {
+  // Handled in renderer — the renderer calls sendMessage() directly.
+  // This IPC exists for extensibility (e.g., analytics).
 });
 
 ipcMain.on('hide-overlay', () => {
@@ -231,6 +242,22 @@ ipcMain.on('set-tray-state', (_event, state) => {
 ipcMain.on('blur-overlay', () => {
   if (mb && mb.window && !mb.window.isDestroyed()) {
     mb.window.blur();
+  }
+});
+
+// Window dragging (manual drag from renderer)
+ipcMain.on('move-window', (_event, deltaX, deltaY) => {
+  if (mb && mb.window && !mb.window.isDestroyed()) {
+    const [x, y] = mb.window.getPosition();
+    mb.window.setPosition(x + deltaX, y + deltaY);
+  }
+});
+
+ipcMain.on('get-window-position', (event) => {
+  if (mb && mb.window && !mb.window.isDestroyed()) {
+    event.returnValue = mb.window.getPosition();
+  } else {
+    event.returnValue = [0, 0];
   }
 });
 
@@ -268,8 +295,8 @@ ipcMain.on('collapse-panel', () => {
   if (!mb || !mb.window || mb.window.isDestroyed()) return;
   const bounds = mb.window.getBounds();
   const cx = bounds.x + Math.round(bounds.width / 2);
-  const newX = Math.round(cx - ORB_WINDOW_SIZE / 2);
-  mb.window.setBounds({ x: newX, y: bounds.y, width: ORB_WINDOW_SIZE, height: ORB_WINDOW_SIZE });
+  const newX = Math.round(cx - ORB_WINDOW_W / 2);
+  mb.window.setBounds({ x: newX, y: bounds.y, width: ORB_WINDOW_W, height: ORB_WINDOW_H });
 });
 
 // Whisper API fallback for voice transcription
@@ -315,8 +342,8 @@ app.whenReady().then(async () => {
     preloadWindow: true,
     showDockIcon: false,
     browserWindow: {
-      width: ORB_WINDOW_SIZE,
-      height: ORB_WINDOW_SIZE,
+      width: ORB_WINDOW_W,
+      height: ORB_WINDOW_H,
       resizable: false,
       frame: false,
       transparent: true,
@@ -398,6 +425,16 @@ app.whenReady().then(async () => {
 
     console.log('[startup] Agent ready — hey, ready when you are');
 
+    // Init suggestion engine
+    suggestionEngine = new SuggestionEngine({
+      browser,
+      computer,
+      screenshotFn: captureScreen,
+      onSuggestions: (suggestions) => sendToRenderer('suggestions-update', suggestions),
+    });
+    suggestionEngine.start();
+    console.log('[startup] Suggestion engine started');
+
     // Register hotkey: Ctrl+Shift+Space activates voice
     globalShortcut.register('Ctrl+Shift+Space', () => {
       sendToRenderer('start-listening');
@@ -412,10 +449,10 @@ app.whenReady().then(async () => {
     // Collapse window back to orb size
     if (mb.window && !mb.window.isDestroyed()) {
       const bounds = mb.window.getBounds();
-      if (bounds.width !== ORB_WINDOW_SIZE || bounds.height !== ORB_WINDOW_SIZE) {
+      if (bounds.width !== ORB_WINDOW_W || bounds.height !== ORB_WINDOW_H) {
         const cx = bounds.x + Math.round(bounds.width / 2);
-        const newX = Math.round(cx - ORB_WINDOW_SIZE / 2);
-        mb.window.setBounds({ x: newX, y: bounds.y, width: ORB_WINDOW_SIZE, height: ORB_WINDOW_SIZE });
+        const newX = Math.round(cx - ORB_WINDOW_W / 2);
+        mb.window.setBounds({ x: newX, y: bounds.y, width: ORB_WINDOW_W, height: ORB_WINDOW_H });
       }
     }
   });
