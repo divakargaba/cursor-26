@@ -270,7 +270,7 @@ app.whenReady().then(async () => {
       displayConfig,
       blurOverlayFn: () => {
         if (mb.window && !mb.window.isDestroyed()) {
-          mb.window.blur();
+          mb.window.hide();
         }
       },
       onProgress: (info) => sendToRenderer('agent-progress', info),

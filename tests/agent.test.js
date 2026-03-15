@@ -428,41 +428,57 @@ describe('Always foreground', () => {
     });
   });
 
-  // -- computer actions: blurOverlayFn called to reveal desktop --
+  // -- _executeTool: blurOverlayFn called for ALL tool types (except confirmation) --
 
-  describe('computer actions call blurOverlayFn to reveal desktop', () => {
-    test('left_click blurs overlay', async () => {
+  describe('_executeTool hides overlay for all actions', () => {
+    test('computer tool hides overlay', async () => {
       const agent = createAgent();
-      await agent._execComputerAction({ action: 'left_click', coordinate: [100, 200] });
+      await agent._executeTool('computer', { action: 'screenshot' });
       expect(agent.blurOverlayFn).toHaveBeenCalled();
     });
 
-    test('right_click blurs overlay', async () => {
-      const agent = createAgent();
-      await agent._execComputerAction({ action: 'right_click', coordinate: [100, 200] });
+    test('browser_action hides overlay', async () => {
+      const browser = createMockBrowser();
+      const agent = createAgent({ browser });
+      await agent._executeTool('browser_action', { action: 'read_page' });
       expect(agent.blurOverlayFn).toHaveBeenCalled();
     });
 
-    test('double_click blurs overlay', async () => {
+    test('focus_window hides overlay', async () => {
       const agent = createAgent();
-      await agent._execComputerAction({ action: 'double_click', coordinate: [100, 200] });
+      await agent._executeTool('focus_window', { title_pattern: 'Discord' });
       expect(agent.blurOverlayFn).toHaveBeenCalled();
     });
 
-    test('middle_click blurs overlay', async () => {
+    test('request_confirmation does NOT hide overlay', async () => {
       const agent = createAgent();
-      await agent._execComputerAction({ action: 'middle_click', coordinate: [100, 200] });
-      expect(agent.blurOverlayFn).toHaveBeenCalled();
+      await agent._executeTool('request_confirmation', { summary: 'test', details: 'test' });
+      expect(agent.blurOverlayFn).not.toHaveBeenCalled();
     });
 
-    test('left_click_drag blurs overlay', async () => {
+    test('overlay hidden before computer action executes', async () => {
       const agent = createAgent();
-      await agent._execComputerAction({
-        action: 'left_click_drag',
-        start_coordinate: [100, 200],
-        coordinate: [300, 400],
-      });
-      expect(agent.blurOverlayFn).toHaveBeenCalled();
+      const callOrder = [];
+      agent.blurOverlayFn = jest.fn(() => callOrder.push('blur'));
+      agent.computer.leftClick = jest.fn(() => callOrder.push('click'));
+
+      await agent._executeTool('computer', { action: 'left_click', coordinate: [100, 200] });
+
+      expect(callOrder[0]).toBe('blur');
+      expect(callOrder[1]).toBe('click');
+    });
+
+    test('overlay hidden before browser action executes', async () => {
+      const browser = createMockBrowser();
+      const callOrder = [];
+      browser.cdpNavigate = jest.fn(() => { callOrder.push('navigate'); return { ok: true }; });
+      const agent = createAgent({ browser });
+      agent.blurOverlayFn = jest.fn(() => callOrder.push('blur'));
+
+      await agent._executeTool('browser_action', { action: 'navigate', url: 'https://example.com' });
+
+      expect(callOrder[0]).toBe('blur');
+      expect(callOrder.includes('navigate')).toBe(true);
     });
   });
 

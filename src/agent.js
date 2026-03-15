@@ -38,32 +38,46 @@ const KEY_NORMALIZE = {
 // System prompt
 // ---------------------------------------------------------------------------
 
-const SYSTEM_PROMPT = `You control a Windows PC via screenshots and mouse/keyboard. Short voice replies (1-2 sentences).
+const SYSTEM_PROMPT = `You are Jarvis — a sharp, proactive copilot controlling a Windows PC. You work WITH the user, not for them. Think ahead.
+
+VOICE (mandatory):
+- Max 1 sentence. No filler. NEVER say "let me", "I'll now", "sure", "ok so", "I'm going to".
+- Trivial tasks (open app, click button, type text) → do silently. ZERO speech.
+- Only speak to: report a result, flag a risk, ask a blocking question, or share a proactive insight.
+- BAD: "Let me open Discord and find Mixo for you." GOOD: (silence — just do it)
+- BAD: "I've taken a screenshot to see the screen." GOOD: (silence — screenshots are internal)
+- GOOD (proactive): "Sent. Heads up — Mixo was last active 3 hours ago."
+
+THINKING:
+- Think 2 steps ahead. What does the user ACTUALLY need, not just what they said?
+- If you notice something useful (weather, risk, better approach) — mention it in ≤1 sentence.
+- Before acting, check [Learned patterns] in context. Use proven paths. Skip trial-and-error.
+- When stuck: try ONE alternative, then ask the user. Never repeat the same action twice.
 
 TOOLS:
-1. computer — screenshot, click, type, key, scroll. Your PRIMARY tool for all desktop interactions.
-2. focus_window — focus a window by title (Win32 API). Use INSTEAD of clicking the taskbar.
-3. browser_action — CDP for web pages (faster than clicking for websites). Auto-connects to Chrome.
-4. request_confirmation — ALWAYS before send/delete/purchase/submit.
+1. computer — screenshot, click, type, key, scroll. PRIMARY for all desktop interactions.
+2. focus_window(title_pattern) — Win32 API window focus. ALWAYS use this instead of clicking taskbar.
+3. browser_action — CDP for web pages. Faster than screenshot→click for websites.
+4. request_confirmation — REQUIRED before send/delete/purchase/submit. Nothing else needs it.
 
-RULES:
-1. Take a screenshot first if you need to see the screen.
-2. Screenshots include OCR text labels with coordinates (e.g. "Discord"@(450,560) 95%). Cross-reference these with what you see to verify click targets — especially for similar-looking icons.
-3. Click targets by coordinates from screenshots — you're trained for pixel-accurate clicking. Use OCR coordinates when visual identification is ambiguous.
-4. Use browser_action for web interactions when CDP is connected (faster than screenshot→click cycle).
-5. request_confirmation before any destructive or externally-visible action.
-6. If stuck after 3 tries, tell the user. Don't loop.
-7. Complete tasks efficiently — minimum screenshots, maximum action per turn.
+SPEED:
+- Act first, report after. Don't ask permission for read-only actions.
+- Chain multiple actions per turn. Don't take a screenshot between every action unless you need to see new state.
+- Use keyboard shortcuts over clicking whenever possible (ctrl+k, ctrl+l, ctrl+t, etc).
+- focus_window > taskbar click. Always.
 
 RECIPES:
-- "type X in Notepad" → screenshot → find Notepad → click it → type text
-- "open Discord" → key("super") → type("Discord") → key("Return")
-- "click the X button" → screenshot → left_click at the button's coordinates
-- "open URL" → browser_action navigate (faster than screenshot clicking)
-- "switch to Discord" → focus_window("Discord") (NOT taskbar clicking)
-- "message USER on Discord" → focus_window("Discord") → key("ctrl+k") → type("USER") → key("Return") → type("message") → key("Return")
+- open app → key("super") → type("appname") → key("Return")
+- switch app → focus_window("AppName")
+- message on Discord → focus_window("Discord") → key("ctrl+k") → type("user") → key("Return") → type("msg") → key("Return")
+- open URL → browser_action navigate
+- search in app → focus_window → keyboard shortcut (ctrl+k, ctrl+l, ctrl+f, etc)
 
-Keep voice replies short. No narration — just actions.`;
+MEMORY:
+- [Learned patterns] are injected into context from past interactions. Follow them.
+- If you discover a faster/better way, just use it — it gets saved automatically.
+- If something failed before, the failure + fix are in context. Don't repeat the mistake.`;
+
 
 // ---------------------------------------------------------------------------
 // Agent class
@@ -85,8 +99,8 @@ class Agent {
     this.browser = browser;
     this.computer = computer;
     this.screenshotFn = screenshotFn;
-    this.blurOverlayFn = blurOverlayFn || (() => {});
-    this.onProgress = onProgress || (() => {});
+    this.blurOverlayFn = blurOverlayFn || (() => { });
+    this.onProgress = onProgress || (() => { });
     this.onConfirmationRequest = onConfirmationRequest || (async () => ({ confirmed: false, reason: 'No confirmation handler' }));
 
     // Display config for coordinate scaling
@@ -104,7 +118,7 @@ class Agent {
     this._lastOCRMap = null;
 
     // Preload tesseract WASM worker (non-blocking)
-    getWorker().catch(() => {});
+    getWorker().catch(() => { });
 
     // Model switching state
     this._currentModel = MODEL_FAST;
@@ -426,15 +440,16 @@ class Agent {
 
   async _executeTool(name, input) {
     try {
+      // Hide overlay before ANY action that touches the desktop/browser —
+      // the user must always see the target window in the foreground
+      if (name !== 'request_confirmation') {
+        this.blurOverlayFn();
+      }
+
       if (name === 'computer') {
         return await this._execComputerAction(input);
       }
 
-      // Auto-blur when switching from browser to computer actions
-      if (name !== 'browser_action' && this._lastToolType === 'browser_action') {
-        this.blurOverlayFn();
-        await new Promise((r) => setTimeout(r, 200));
-      }
       this._lastToolType = name;
 
       switch (name) {
@@ -467,7 +482,6 @@ class Agent {
       case 'left_click': {
         const [px, py] = this._scaleToPhysical(coordinate);
         console.log(`[click] API(${coordinate[0]}, ${coordinate[1]}) → Physical(${px}, ${py})`);
-        this.blurOverlayFn();
         await this.computer.leftClick(px, py);
         await new Promise((r) => setTimeout(r, 100));
         return await this._captureScreenshot(false);
@@ -476,7 +490,6 @@ class Agent {
       case 'right_click': {
         const [px, py] = this._scaleToPhysical(coordinate);
         console.log(`[right_click] API(${coordinate[0]}, ${coordinate[1]}) → Physical(${px}, ${py})`);
-        this.blurOverlayFn();
         await this.computer.rightClick(px, py);
         await new Promise((r) => setTimeout(r, 100));
         return await this._captureScreenshot(false);
@@ -485,7 +498,6 @@ class Agent {
       case 'double_click': {
         const [px, py] = this._scaleToPhysical(coordinate);
         console.log(`[double_click] API(${coordinate[0]}, ${coordinate[1]}) → Physical(${px}, ${py})`);
-        this.blurOverlayFn();
         await this.computer.doubleClick(px, py);
         await new Promise((r) => setTimeout(r, 100));
         return await this._captureScreenshot(false);
@@ -494,7 +506,6 @@ class Agent {
       case 'middle_click': {
         const [px, py] = this._scaleToPhysical(coordinate);
         console.log(`[middle_click] API(${coordinate[0]}, ${coordinate[1]}) → Physical(${px}, ${py})`);
-        this.blurOverlayFn();
         await this.computer.middleClick(px, py);
         await new Promise((r) => setTimeout(r, 100));
         return await this._captureScreenshot(false);
@@ -540,7 +551,6 @@ class Agent {
         const [sx, sy] = this._scaleToPhysical(start_coordinate);
         const [ex, ey] = this._scaleToPhysical(coordinate);
         console.log(`[drag] Physical(${sx}, ${sy}) → Physical(${ex}, ${ey})`);
-        this.blurOverlayFn();
         await this.computer.leftClickDrag(sx, sy, ex, ey);
         await new Promise((r) => setTimeout(r, 100));
         return await this._captureScreenshot(false);
