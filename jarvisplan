@@ -1,0 +1,221 @@
+# Intelligence, Memory & Personality Layer
+
+Turn the assistant from "dumb executor that narrates its actions" into a proactive, learning, Jarvis-like copilot that thinks ahead, speaks concisely WHILE acting, and gets smarter every hour of use.
+
+---
+
+## Phase 1: Personality & Prompt Rewrite
+
+### [MODIFY] [agent.js](file:///c:/Users/omara/ai-assistant/src/agent.js)
+
+Replace `SYSTEM_PROMPT` (lines 41-66) entirely. The new prompt enforces:
+
+**Voice personality:**
+- 1 sentence max per voice reply. No narration. No "let me...", "I'll now...", "ok so I'm going to..."
+- Speak ONLY when there's something useful to say: a result, a question, a risk flag
+- Proactive insights: if user asks for a flight, check weather too. If drafting an email, flag if recipient looks wrong
+
+**Concurrent action + speech:**
+- Text responses go to speech IMMEDIATELY (streamed), tools execute in parallel
+- Don't wait for all actions to finish before speaking
+
+**Proactive thinking rules:**
+```
+PROACTIVE EXAMPLES:
+- User: "book cheapest flight April to San Diego"
+  → DO: search flights + check weather for those dates in parallel
+  → SAY: "Found $180 round trip April 12-26. Heads up — San Diego averages 65°F in April, perfect for a trip."
+  
+- User: "message Mixo where is KingD"
+  → DO: focus_window("Discord") → ctrl+k → type Mixo → enter → type "where is KingD" → enter
+  → SAY: nothing (task is trivial, no speech needed)
+  
+- User: "send Omar the proposal"
+  → DO: find Omar's chat, type the message
+  → SAY: "Ready to send. Want me to go ahead?" (confirmation required)
+```
+
+**Memory-aware:**
+- Before every action sequence, check `memory.getPlaybook(app)` for learned shortcuts
+- When an action fails, record why. When it succeeds, record the working path
+- Inject relevant playbook entries into the system context
+
+### New prompt structure:
+
+```javascript
+const SYSTEM_PROMPT = `You are Jarvis — a sharp, proactive voice assistant controlling a Windows PC.
+
+VOICE RULES:
+- Max 1 sentence spoken. No narration of your actions. NEVER say "let me", "I'll now", "ok so".
+- Speak only to: report results, flag risks, ask necessary questions.
+- If the task is simple (open app, click button, type text) → do it silently. No speech.
+- If you find something unexpected → mention it briefly: "Heads up, [thing]."
+
+THINKING RULES:
+- Think TWO steps ahead. What does the user actually need, not just what they said?
+- Check for risks, edge cases, better alternatives — mention only important ones.
+- Use learned playbooks from memory before trying anything new.
+- When stuck: try ONE different approach, then ask the user. Never loop.
+
+TOOLS: [same as current]
+
+SPEED RULES:
+- Act first, report after. Don't ask permission for read-only actions.
+- request_confirmation ONLY for: send, delete, submit, purchase, post.
+- Chain multiple actions per turn when possible.
+- Use focus_window() to switch apps, never click the taskbar.
+
+MEMORY:
+- You have access to learned playbooks for each app. Use them.
+- If you discover a faster way to do something, it will be saved automatically.
+- You know the user's preferences and past patterns. Apply them.`;
+```
+
+---
+
+## Phase 2: Adaptive Memory System
+
+### [MODIFY] [memory.js](file:///c:/Users/omara/ai-assistant/src/memory.js)
+
+Current memory only stores successful action sequences as keyword bags. Needs:
+
+**1. Playbooks** (action sequences that work for specific apps):
+```javascript
+// e.g. { app: "discord", task: "message_user", steps: [...], successRate: 0.9, lastUsed: ... }
+```
+
+**2. Failure log** (what went wrong and how it was fixed):
+```javascript
+// e.g. { app: "discord", action: "click", target: "taskbar icon", outcome: "wrong_window", 
+//        fix: "use focus_window instead", timestamp: ... }
+```
+
+**3. User preferences** (learned from behavior):
+```javascript
+// e.g. { user_prefers_keyboard_shortcuts: true, default_browser: "chrome", email_app: "gmail" }
+```
+
+**4. Context memory** (long-term user goals/info mentioned in conversation):
+```javascript
+// e.g. { type: "fact", content: "User has a trip planned for April", source: "conversation", timestamp: ... }
+```
+
+### New memory architecture:
+
+```javascript
+// data/memory.json → split into:
+// data/playbooks.json    — successful action sequences per app
+// data/failures.json     — what didn't work and why
+// data/preferences.json  — user behavior patterns
+// data/context.json      — things the user has mentioned (facts, goals, preferences)
+```
+
+**Recording logic changes in agent.js [_saveToMemory()](file:///c:/Users/omara/ai-assistant/src/agent.js#882-895):**
+- After each task: did it succeed? Record the action path as a playbook entry
+- Did actions fail along the way? Record them in failures with the fix
+- Did the user mention any personal info, preferences, or goals? Extract and store
+
+**Retrieval at chat start:**
+- Detect which app(s) are relevant → inject playbook tips into system context
+- Check failures for the same app → inject "avoid doing X, do Y instead"
+- Check context memory for relevant user facts
+
+---
+
+## Phase 3: Always-On Voice with Wake Word
+
+### [MODIFY] [main.js](file:///c:/Users/omara/ai-assistant/electron/main.js) + [panel.html](file:///c:/Users/omara/ai-assistant/electron/panel.html)
+
+Current: user clicks "Speak" button → records → sends to Whisper → agent processes → TTS response.
+
+**Target:** Always-on mic → wake word "Jarvis" → auto-activate → continuous conversation → auto-deactivate after silence.
+
+**Implementation:**
+1. **Continuous VAD (Voice Activity Detection):** Use Web Audio API `AnalyserNode` to detect when the user starts/stops speaking
+2. **Wake word detection:** Simple local approach — stream audio to Whisper in small chunks (2-3 sec), check if transcription contains "Jarvis"/"hey Jarvis". When detected, switch to active listening mode
+3. **Active session:** Once activated, keep recording until 3 seconds of silence, then process
+4. **Toggle:** Tray icon toggle for always-on vs manual mode
+
+> [!IMPORTANT]
+> Wake word detection using Whisper costs ~$0.006/minute. For always-on, that's ~$0.36/hour. 
+> Alternative: use a local wake word library like [Porcupine](https://picovoice.ai/platform/porcupine/) (free tier: 3 custom wake words) for zero-cost always-on, then switch to Whisper only when activated.
+
+### [MODIFY] [agent.js](file:///c:/Users/omara/ai-assistant/src/agent.js)
+
+**Concurrent speech + action:**
+- Current flow: [_runLoop()](file:///c:/Users/omara/ai-assistant/src/agent.js#297-402) returns text ONLY after all tool iterations are done
+- New flow: emit [onProgress({ type: 'speech', text })](file:///c:/Users/omara/ai-assistant/electron/main.js#276-277) immediately when Claude returns text, WHILE tools continue executing
+- The renderer speaks this text via TTS immediately, agent keeps working
+
+---
+
+## Phase 4: Proactive Context Enrichment
+
+### [NEW] [src/enrichment.js](file:///c:/Users/omara/ai-assistant/src/enrichment.js)
+
+When the user asks for something, run a quick parallel "enrichment" step:
+- Flight search → also fetch destination weather
+- Email draft → verify recipient exists in contacts
+- Meeting scheduling → check calendar conflicts
+- File operations → check disk space
+
+**Implementation:** A simple map of task patterns → enrichment functions. Runs in parallel with the main action. Results are injected into the conversation as additional context.
+
+**This is what creates the "wow I didn't even think about that" moments.**
+
+---
+
+## Phase 5: Self-Learning from Trial & Error
+
+### [MODIFY] [agent.js](file:///c:/Users/omara/ai-assistant/src/agent.js)
+
+After each tool execution, record the outcome:
+```javascript
+// In _executeTool():
+const startTime = Date.now();
+const result = await this._execComputerAction(input);
+const elapsed = Date.now() - startTime;
+
+// Did Claude try to click something and the screen didn't change?
+// → Record: "clicking X in app Y doesn't work, suggest alternative"
+
+// Did focus_window succeed where left_click failed?
+// → Record: "for app Y, use focus_window instead of taskbar click"
+
+// Did a keyboard shortcut work faster than a click sequence?
+// → Record: "ctrl+k is faster than clicking search in Discord"
+```
+
+**Auto-learning heuristics:**
+- Same action fails 2x → auto-add to failures, suggest alternative on 3rd attempt
+- Same action succeeds with different params → update playbook with latest working params
+- Action sequence takes >10 seconds → flag as "slow path", look for shortcuts next time
+
+---
+
+## Build Order
+
+| Order | What | Time | Impact |
+|-------|------|------|--------|
+| **1** | System prompt rewrite | 15 min | Stops narration, adds proactivity, Jarvis personality |
+| **2** | Memory system upgrade | 30 min | Playbooks + failures + preferences + context |
+| **3** | Concurrent speech + action | 20 min | Speaks while acting, not before/after |
+| **4** | Self-learning from outcomes | 20 min | Gets smarter every interaction |
+| **5** | Always-on voice (wake word) | 45 min | "Jarvis" activation, no click needed |
+| **6** | Proactive enrichment | 30 min | Weather checks, risk flags, "didn't think of that" moments |
+
+---
+
+## Verification Plan
+
+### Automated Tests
+- Run the app, say "open Discord and message Mixo saying hey"
+- Verify: no narration ("let me click..."), action completes silently, no voice output for trivial tasks
+- Verify: memory.json contains the successful playbook entry after completion
+
+### Manual Verification
+- Use for 30 min across Discord + Chrome + Notepad
+- Check `data/playbooks.json` grows with working action sequences
+- Check `data/failures.json` captures failed attempts
+- Verify 2nd attempt at same task uses playbook (faster, fewer iterations)
+- Test proactive behavior: "find flights to San Diego in April" → should mention weather
