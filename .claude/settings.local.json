@@ -48,7 +48,13 @@
       "WebFetch(domain:www.hyperwriteai.com)",
       "WebFetch(domain:o-mega.ai)",
       "WebFetch(domain:api.github.com)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(pgrep:*)",
+      "Bash(kill:*)",
+      "Bash(pkill:*)",
+      "Bash(lsof:*)",
+      "Bash(open:*)",
+      "Bash(osascript:*)"
     ]
   }
 }

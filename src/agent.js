@@ -4,6 +4,7 @@ require('dotenv').config();
 const Anthropic = require('@anthropic-ai/sdk');
 const crypto = require('crypto');
 
+const { clipboard } = require('electron');
 const Memory = require('./memory');
 const { buildOCRMap, getWorker } = require('./ocr-map');
 
@@ -77,7 +78,6 @@ MEMORY:
 - [Learned patterns] are injected into context from past interactions. Follow them.
 - If you discover a faster/better way, just use it — it gets saved automatically.
 - If something failed before, the failure + fix are in context. Don't repeat the mistake.`;
-
 
 // ---------------------------------------------------------------------------
 // Agent class
@@ -275,6 +275,17 @@ class Agent {
     console.time('[agent] chat total');
     this.onProgress({ type: 'status', text: 'Reading context...' });
 
+    // Retry CDP connection on every message — if user restarted Chrome with debug flag, we pick it up
+    if (this.browser && typeof this.browser.isConnected === 'function' && !this.browser.isConnected()) {
+      if (typeof this.browser.connectToChrome === 'function') {
+        console.log('[agent] CDP not connected — retrying...');
+        const ok = await this.browser.connectToChrome();
+        if (ok) {
+          console.log('[agent] CDP reconnected on retry!');
+        }
+      }
+    }
+
     this._currentActions = [];
     this._chatStartTime = Date.now();
 
@@ -397,10 +408,18 @@ class Agent {
           result.unshift({ type: 'text', text: loopCheck.message });
         }
 
+        // Detect if tool result contains an error — mark is_error so the model sees it clearly
+        const resultText = result.filter((r) => r.type === 'text').map((r) => r.text).join(' ').toLowerCase();
+        const isToolError = resultText.includes('failed') || resultText.includes('error') ||
+          resultText.includes('could not') || resultText.includes('not found') ||
+          resultText.includes('not available') ||
+          resultText.includes('no browser connection') || resultText.includes('no page available');
+
         toolResults.push({
           type: 'tool_result',
           tool_use_id: tu.id,
           content: result,
+          ...(isToolError ? { is_error: true } : {}),
         });
       }
 
@@ -415,6 +434,11 @@ class Agent {
           });
         }
       }
+
+      // Log turn summary
+      const okCount = toolResults.filter((r) => !r.is_error).length;
+      const errCount = toolResults.filter((r) => r.is_error).length;
+      console.log(`[agent] Turn ${iterations}: ${toolUses.length} tools called, ${okCount} ok, ${errCount} errors`);
 
       this.history.push({ role: 'user', content: toolResults });
       console.timeEnd(`[agent] iteration-${iterations}`);
@@ -438,7 +462,38 @@ class Agent {
   // Tool execution
   // =========================================================================
 
+  _logToolCall(name, input) {
+    const parts = [name];
+    if (name === 'browser_action') {
+      parts.push(input.action || '?');
+      if (input.url) parts.push(`url=${input.url.slice(0, 60)}`);
+      if (input.selector) parts.push(`sel=${input.selector.slice(0, 40)}`);
+      if (input.text) parts.push(`text="${input.text.slice(0, 30)}"`);
+      if (input.key) parts.push(`key=${input.key}`);
+    } else if (name === 'computer') {
+      parts.push(input.action || '?');
+      if (input.coordinate) parts.push(`coord=(${input.coordinate.join(',')})`);
+      if (input.text) parts.push(`text="${(input.text || '').slice(0, 30)}"`);
+    }
+    console.log(`[tool] EXEC ${parts.join(' ')}`);
+  }
+
+  _logToolResult(name, result) {
+    // Extract first text content from result array
+    const firstText = result.find((r) => r.type === 'text');
+    const snippet = firstText ? firstText.text.slice(0, 120) : '(no text)';
+    const hasError = snippet.toLowerCase().includes('failed') ||
+      snippet.toLowerCase().includes('error') ||
+      snippet.toLowerCase().includes('could not') ||
+      snippet.toLowerCase().includes('no browser') ||
+      snippet.toLowerCase().includes('not found') ||
+      snippet.toLowerCase().includes('not available');
+    const tag = hasError ? 'FAIL' : 'OK';
+    console.log(`[tool] ${tag}   ${name} → ${snippet}`);
+  }
+
   async _executeTool(name, input) {
+    this._logToolCall(name, input);
     try {
       // Hide overlay before ANY action that touches the desktop/browser —
       // the user must always see the target window in the foreground
@@ -452,18 +507,24 @@ class Agent {
 
       this._lastToolType = name;
 
+      let result;
       switch (name) {
         case 'browser_action':
           return await this._execBrowserAction(input);
         case 'focus_window':
           return await this._execFocusWindow(input);
         case 'request_confirmation':
-          return await this._execConfirmation(input);
+          result = await this._execConfirmation(input);
+          break;
         default:
-          return [{ type: 'text', text: `Unknown tool: ${name}` }];
+          result = [{ type: 'text', text: `Unknown tool: ${name}` }];
       }
+      this._logToolResult(name, result);
+      return result;
     } catch (err) {
-      return [{ type: 'text', text: `Error executing ${name}: ${err.message}` }];
+      const errResult = [{ type: 'text', text: `Error executing ${name}: ${err.message}` }];
+      console.log(`[tool] ERROR ${name} → ${err.message}`);
+      return errResult;
     }
   }
 
@@ -769,6 +830,21 @@ class Agent {
         return [{ type: 'text', text: `Pressed ${input.key}` }];
       }
 
+      case 'list_tabs': {
+        const tabs = await this.browser.listTabs();
+        if (tabs.length === 0) return [{ type: 'text', text: 'No open tabs found (or not connected to Chrome).' }];
+        const tabList = tabs.map((t, i) => `  [${i}] ${t.title} — ${t.url.slice(0, 100)}`).join('\n');
+        return [{ type: 'text', text: `Open tabs (${tabs.length}):\n${tabList}\n\nUse switch_tab with a URL or title pattern to switch to a tab.` }];
+      }
+
+      case 'switch_tab': {
+        const pattern = input.url || input.text || input.value || '';
+        if (!pattern) return [{ type: 'text', text: 'switch_tab requires a url or text pattern (e.g. "discord", "github.com").' }];
+        const res = await this.browser.switchToTab(pattern);
+        if (!res.ok) return [{ type: 'text', text: `Switch tab failed: ${res.error}` }];
+        return [{ type: 'text', text: `Switched to tab: ${res.title} — ${res.url.slice(0, 100)}` }];
+      }
+
       default:
         return [{ type: 'text', text: `Unknown browser_action: ${action}` }];
     }
@@ -880,6 +956,8 @@ class Agent {
         if (a === 'type') return `Typing into ${(tu.input.selector || '').slice(0, 30)}...`;
         if (a === 'scroll') return `Scrolling ${tu.input.direction || 'down'}...`;
         if (a === 'press_key') return `Pressing ${tu.input.key || '?'}...`;
+        if (a === 'list_tabs') return 'Listing open tabs...';
+        if (a === 'switch_tab') return `Switching to tab matching "${(tu.input.url || tu.input.text || '').slice(0, 30)}"...`;
         return `Browser: ${a}...`;
       }
       case 'focus_window':

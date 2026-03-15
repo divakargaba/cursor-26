@@ -1,5 +1,25 @@
 require('dotenv').config();
 
+// ---------------------------------------------------------------------------
+// Guard against EPIPE errors on stdout/stderr.
+// When the Electron app outlives the terminal that spawned it, the stdio
+// pipe closes and every console.log throws an uncaught EPIPE exception.
+// ---------------------------------------------------------------------------
+for (const stream of [process.stdout, process.stderr]) {
+  if (stream && typeof stream.on === 'function') {
+    stream.on('error', (err) => {
+      if (err.code === 'EPIPE' || err.message?.includes('EPIPE')) return; // swallow
+      throw err; // re-throw non-EPIPE errors
+    });
+  }
+}
+
+process.on('uncaughtException', (err) => {
+  if (err.code === 'EPIPE' || err.message?.includes('EPIPE')) return; // swallow
+  console.error('[main] Uncaught exception:', err);
+  process.exit(1);
+});
+
 const {
   app,
   BrowserWindow,
@@ -18,6 +38,10 @@ const browser = USE_MCP ? require('../src/mcp-browser') : require('../src/browse
 
 // Target long edge for downscaled screenshots (Anthropic recommends 1024x768 max)
 const TARGET_LONG_EDGE = 1024;
+
+const ORB_WINDOW_SIZE = 200;
+const PANEL_WIDTH = 360;
+const PANEL_HEIGHT = 480;
 
 let mb = null;
 let agent = null;
@@ -38,14 +62,99 @@ if (!gotLock) {
 }
 
 function createTrayIcon(color) {
+  // Create a small PNG tray icon programmatically.
+  // macOS requires actual image data (not SVG) and prefers 16x16 or 22x22 template images.
+  // We build a minimal 16x16 RGBA buffer and draw a filled circle.
   const size = 16;
-  const canvas = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">
-    <circle cx="8" cy="8" r="6" fill="${color}"/>
-  </svg>`;
+  const r = 6;
+  const cx = 8, cy = 8;
+
+  // Parse hex color
+  const hex = color.replace('#', '');
+  const cr = parseInt(hex.substring(0, 2), 16);
+  const cg = parseInt(hex.substring(2, 4), 16);
+  const cb = parseInt(hex.substring(4, 6), 16);
+
+  // Create RGBA pixel buffer
+  const pixels = Buffer.alloc(size * size * 4, 0);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const dx = x - cx, dy = y - cy;
+      if (dx * dx + dy * dy <= r * r) {
+        const offset = (y * size + x) * 4;
+        pixels[offset] = cr;
+        pixels[offset + 1] = cg;
+        pixels[offset + 2] = cb;
+        pixels[offset + 3] = 255;
+      }
+    }
+  }
+
   return nativeImage.createFromBuffer(
-    Buffer.from(canvas),
+    createPNGBuffer(size, size, pixels),
     { width: size, height: size }
   );
+}
+
+/**
+ * Create a minimal PNG from raw RGBA pixel data.
+ * Avoids needing canvas or sharp — just raw zlib + PNG structure.
+ */
+function createPNGBuffer(width, height, rgbaPixels) {
+  const zlib = require('zlib');
+
+  // PNG filter: prepend 0 (None filter) to each row
+  const filtered = Buffer.alloc(height * (width * 4 + 1));
+  for (let y = 0; y < height; y++) {
+    filtered[y * (width * 4 + 1)] = 0; // filter byte
+    rgbaPixels.copy(filtered, y * (width * 4 + 1) + 1, y * width * 4, (y + 1) * width * 4);
+  }
+
+  const deflated = zlib.deflateSync(filtered);
+
+  // Build PNG
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+
+  function chunk(type, data) {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length);
+    const typeB = Buffer.from(type);
+    const crcData = Buffer.concat([typeB, data]);
+    const crc = Buffer.alloc(4);
+    crc.writeInt32BE(crc32(crcData));
+    return Buffer.concat([len, typeB, data, crc]);
+  }
+
+  // IHDR
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;  // bit depth
+  ihdr[9] = 6;  // color type: RGBA
+  ihdr[10] = 0; // compression
+  ihdr[11] = 0; // filter
+  ihdr[12] = 0; // interlace
+
+  const iend = Buffer.alloc(0);
+
+  return Buffer.concat([
+    signature,
+    chunk('IHDR', ihdr),
+    chunk('IDAT', deflated),
+    chunk('IEND', iend),
+  ]);
+}
+
+/** CRC32 for PNG chunks */
+function crc32(buf) {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) {
+    crc ^= buf[i];
+    for (let j = 0; j < 8; j++) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xEDB88320 : 0);
+    }
+  }
+  return (crc ^ 0xFFFFFFFF) | 0;
 }
 
 function setTrayState(state) {
@@ -179,6 +288,23 @@ ipcMain.handle('capture-screenshot', async () => {
   return await captureScreen();
 });
 
+// Two-stage panel: expand from orb to full panel
+ipcMain.on('expand-panel', () => {
+  if (!mb || !mb.window || mb.window.isDestroyed()) return;
+  const bounds = mb.window.getBounds();
+  const cx = bounds.x + Math.round(bounds.width / 2);
+  const newX = Math.round(cx - PANEL_WIDTH / 2);
+  mb.window.setBounds({ x: newX, y: bounds.y, width: PANEL_WIDTH, height: PANEL_HEIGHT });
+});
+
+ipcMain.on('collapse-panel', () => {
+  if (!mb || !mb.window || mb.window.isDestroyed()) return;
+  const bounds = mb.window.getBounds();
+  const cx = bounds.x + Math.round(bounds.width / 2);
+  const newX = Math.round(cx - ORB_WINDOW_SIZE / 2);
+  mb.window.setBounds({ x: newX, y: bounds.y, width: ORB_WINDOW_SIZE, height: ORB_WINDOW_SIZE });
+});
+
 // Whisper API fallback for voice transcription
 ipcMain.handle('transcribe-audio', async (_event, { audioBase64 }) => {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -222,11 +348,13 @@ app.whenReady().then(async () => {
     preloadWindow: true,
     showDockIcon: false,
     browserWindow: {
-      width: 380,
-      height: 560,
+      width: ORB_WINDOW_SIZE,
+      height: ORB_WINDOW_SIZE,
       resizable: false,
       frame: false,
       transparent: true,
+      hasShadow: false,
+      backgroundColor: '#00000000',
       alwaysOnTop: false,
       skipTaskbar: true,
       webPreferences: {
@@ -260,6 +388,7 @@ app.whenReady().then(async () => {
       }
     } catch (err) {
       console.log('[startup] Browser connect error:', err.message);
+      cdpResult = { connected: false, message: err.message };
     }
 
     // Init agent with computer-use display config
@@ -271,6 +400,17 @@ app.whenReady().then(async () => {
       blurOverlayFn: () => {
         if (mb.window && !mb.window.isDestroyed()) {
           mb.window.hide();
+        }
+      },
+      hideOverlayFn: () => {
+        if (mb.window && !mb.window.isDestroyed()) {
+          mb.hideWindow();
+        }
+      },
+      showOverlayFn: () => {
+        if (mb && mb.window && !mb.window.isDestroyed()) {
+          mb.showWindow();
+          mb.window.showInactive();
         }
       },
       onProgress: (info) => sendToRenderer('agent-progress', info),
@@ -291,9 +431,19 @@ app.whenReady().then(async () => {
     });
   });
 
-  // Emit focus-lost when panel loses focus
+  // On hide: reset to orb mode and collapse window
   mb.on('hide', () => {
     sendToRenderer('focus-lost');
+    sendToRenderer('panel-reset');
+    // Collapse window back to orb size
+    if (mb.window && !mb.window.isDestroyed()) {
+      const bounds = mb.window.getBounds();
+      if (bounds.width !== ORB_WINDOW_SIZE || bounds.height !== ORB_WINDOW_SIZE) {
+        const cx = bounds.x + Math.round(bounds.width / 2);
+        const newX = Math.round(cx - ORB_WINDOW_SIZE / 2);
+        mb.window.setBounds({ x: newX, y: bounds.y, width: ORB_WINDOW_SIZE, height: ORB_WINDOW_SIZE });
+      }
+    }
   });
 });
 
