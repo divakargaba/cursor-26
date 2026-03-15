@@ -217,6 +217,7 @@ class AlwaysOnListener {
 
     this.enabled = false;
     this._processingCommand = false;
+    this._ttsSpeaking = false; // mute mic while Jarvis is talking
     this._whisperStream = null;
     this._audioContext = null;
     this._analyser = null;
@@ -396,8 +397,8 @@ class AlwaysOnListener {
         if (avg < 10) {
           // Silence
           if (silentSince === 0) silentSince = Date.now();
-          else if (Date.now() - silentSince > SILENCE_THRESHOLD && elapsed > 3000) {
-            // Been silent for 1.5s and we have at least 3s of audio
+          else if (Date.now() - silentSince > SILENCE_THRESHOLD && elapsed > 1000) {
+            // Been silent for 1.5s and we have at least 1s of audio
             recorder.stop();
             return;
           }
@@ -440,6 +441,17 @@ class AlwaysOnListener {
 
   _checkWakeWord(transcript, isFinal) {
     const lower = transcript.toLowerCase();
+    const cleanAll = lower.replace(/[.,!?'"]+/g, '').trim();
+
+    // Bare "stop" without wake word -- works during active execution/TTS
+    const bareAbort = /^(stop|cancel|abort|shut up|quiet|enough)$/i;
+    if (isFinal && (this._processingCommand || this._ttsSpeaking) && bareAbort.test(cleanAll)) {
+      console.log('[always-on] Bare abort detected');
+      this._processingCommand = false;
+      this.onAbort();
+      return;
+    }
+
     const wakeIdx = lower.indexOf('jarvis');
     if (wakeIdx === -1) return;
 
@@ -447,8 +459,9 @@ class AlwaysOnListener {
     const afterLower = afterWake.toLowerCase();
 
     // Abort commands always get through, even mid-execution
-    const abortPatterns = /^(stop|cancel|abort|never\s?mind|hold on|wait)$/i;
-    if (isFinal && abortPatterns.test(afterLower)) {
+    const cleanAfter = afterLower.replace(/[.,!?'"]+/g, '').trim();
+    const abortPatterns = /^(stop|cancel|abort|never\s?mind|hold on|wait|stop that|stop it|shut up|enough|quiet)$/i;
+    if (isFinal && abortPatterns.test(cleanAfter)) {
       console.log('[always-on] Abort command detected');
       this._processingCommand = false;
       this.onAbort();
@@ -457,14 +470,16 @@ class AlwaysOnListener {
 
     // Deactivation commands always get through
     const deactivatePatterns = /^(deactivate|stop listening|go to sleep|shut down|goodbye|good night|sleep)$/i;
-    if (isFinal && deactivatePatterns.test(afterLower)) {
+    if (isFinal && deactivatePatterns.test(cleanAfter)) {
       console.log('[always-on] Deactivation command detected');
       this._processingCommand = false;
       this.onDeactivate();
       return;
     }
 
-    if (this._processingCommand) return;
+    // While TTS is playing or processing, only abort/deactivate get through
+    if (this._processingCommand && !abortPatterns.test(cleanAfter) && !deactivatePatterns.test(cleanAfter)) return;
+    if (this._ttsSpeaking && !abortPatterns.test(cleanAfter) && !deactivatePatterns.test(cleanAfter)) return;
 
     if (isFinal) {
       this._processingCommand = true;
@@ -518,5 +533,9 @@ class AlwaysOnListener {
 
   resume() {
     this._processingCommand = false;
+  }
+
+  setTTSSpeaking(speaking) {
+    this._ttsSpeaking = speaking;
   }
 }

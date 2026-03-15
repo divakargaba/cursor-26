@@ -9,9 +9,10 @@ const Memory = require('./memory');
 const Enrichment = require('./enrichment');
 const { buildOCRMap, getWorker } = require('./ocr-map');
 
-// Models — Haiku is the only model that supports computer_20250124 tool type
+// Models — Haiku first (fast), auto-upgrade to Sonnet on retry/failure
 const MODEL_FAST = process.env.AI_MODEL_DEFAULT || 'claude-haiku-4-5-20251001';
-const MODEL_ACCURATE = 'claude-haiku-4-5-20251001';
+const MODEL_ACCURATE = 'claude-sonnet-4-5';
+const UPGRADE_AFTER_ITERATIONS = 4; // switch to Sonnet if Haiku is struggling
 
 const MAX_TOKENS = 4096;
 const MAX_ITERATIONS = 12;
@@ -77,14 +78,13 @@ SPEED:
 - Use keyboard shortcuts over clicking whenever possible (ctrl+k, ctrl+l, ctrl+t, etc).
 - focus_window > taskbar click. Always. No exceptions.
 
-RECIPES:
-- open app → key("super") → type("appname") → key("Return")
-- switch app → focus_window("AppName") — NEVER click taskbar
-- bring browser to front → focus_window("Chrome") — user must SEE the window
+RECIPES (use these EXACT sequences, do NOT improvise):
+- open app → focus_window("AppName"). If not found → key("super") → type("appname") → key("Return")
+- open URL → browser_action navigate url=THE_URL. This is the FASTEST way. Do NOT type URLs manually.
+- FLIGHTS → browser_action navigate url=https://www.google.com/travel/flights → then interact with the page
+- GMAIL → browser_action navigate url=https://mail.google.com → read page → interact
 - message on Discord → focus_window("Discord") → key("ctrl+k") → type("user") → key("Return") → type("msg") → key("Return")
-- open URL → focus_window("Chrome") → browser_action navigate
-- search in app → focus_window → keyboard shortcut (ctrl+k, ctrl+l, ctrl+f, etc)
-- switch tab → focus_window("Chrome") → browser_action switch_tab or Ctrl+Tab
+- switch tab → browser_action switch_tab pattern=NAME
 
 PROACTIVE THINKING (this is what makes you Jarvis, not just a clicker):
 Before executing ANY task, ask yourself these 3 questions silently:
@@ -107,9 +107,26 @@ When the user is clearly overwhelmed (multiple tasks, rushed tone, "just do it" 
 - Batch related actions. If they ask about flights, also pull weather without being asked.
 - Surface risks they'd miss: "Sent. FYI that flight has a 45min layover in Denver — tight if delayed."
 
+TASK CLASSIFICATION (decide before acting):
+- TRIVIAL: open app, navigate URL, click something, type text, simple message → ZERO speech. Just execute silently.
+- SIMPLE: check weather, read something, find specific info → one sentence result, no enrichment.
+- COMPLEX: flight search, email draft, scheduling, research → execute AND check enrichments in parallel.
+  For flights: check weather + calendar conflicts + pricing.
+  For email: read existing thread first, check tone, check if they already replied.
+  For scheduling: check conflicts, back-to-back meetings, travel days.
+  COMPLEX RESPONSE RULE: give ONE recommendation. Not a list of options with arrival times and durations.
+  Say: "Found a round trip for 180 dollars on April 11th. Weather there is around 73 degrees and dry. Want me to lock it in?"
+  NOT: "Here are some options. Option 1: departure 8am, arrival 3pm, duration 7h. Option 2:..."
+  Pick the BEST one. State price and dates. Include weather from the enrichment data if available. Wait for confirmation.
+  NEVER use abbreviations in speech. Write out "dollars" not "$", "degrees" not "C", "percent" not "%".
+- PASSIVE ALERT: something you noticed without being asked → one sentence, most important flag only.
+
 MEMORY:
 - [Learned patterns] are injected into context from past interactions. Follow them.
-- [User profile] contains who the user is, their goals, schedule, preferences. Use this for proactive suggestions.
+- [User profile] is injected below. You KNOW this person. Every response should reflect that knowledge.
+  When they mention a person, check if that person is in the profile. Treat important contacts with elevated priority.
+  When they mention dates, check against their known schedule (classes, work, events, deadlines).
+  When they seem overwhelmed, be MORE proactive, not less.
 - If you discover a faster/better way, just use it — it gets saved automatically.
 - If something failed before, the failure + fix are in context. Don't repeat the mistake.`;
 
@@ -147,7 +164,7 @@ class Agent {
     this.history = [];
     this.toolCallHistory = [];
     this.memory = new Memory();
-    this.enrichment = new Enrichment({ browser });
+    this.enrichment = new Enrichment({ browser, memory: this.memory });
     this._currentActions = [];
     this._lastToolType = null;
     this._lastOCRMap = null;
@@ -316,6 +333,87 @@ class Agent {
   }
 
   // =========================================================================
+  // Extract the most important enrichment insight for immediate speech
+  // =========================================================================
+
+  _extractTopInsight(enrichmentContext) {
+    if (!enrichmentContext) return null;
+    const lines = enrichmentContext.split('\n').filter(l => l.startsWith('['));
+
+    const calendar = lines.find(l => l.startsWith('[CALENDAR]'));
+    const pricing = lines.find(l => l.startsWith('[PRICING]'));
+    const context = lines.find(l => l.startsWith('[CONTEXT]') || l.startsWith('[PRIORITY]'));
+    // Weather is NOT spoken here -- saved for the final result after task completes
+
+    const sentences = ['On it.'];
+
+    if (calendar) {
+      const m = calendar.match(/Potential conflicts.*?:\s*(.+?)\.?\s*Mention/);
+      if (m) {
+        const conflicts = m[1].split(';').map(c => c.trim()).slice(0, 2);
+        sentences.push(`Just so you know, you've got ${conflicts.join(' and ')} around that time.`);
+      }
+    }
+
+    if (pricing) {
+      const m = pricing.match(/\[PRICING\]\s*(.+)/);
+      if (m) {
+        // Clean up abbreviations for TTS
+        sentences.push(m[1].replace(/%/g, ' percent').replace(/--/g, ',').trim());
+      }
+    }
+
+    if (context && sentences.length <= 1) {
+      const m = context.match(/\[(?:CONTEXT|PRIORITY)\]\s*(.+)/);
+      if (m) return m[1].replace(/%/g, ' percent').trim();
+    }
+
+    if (sentences.length <= 1) return null; // Don't speak if only "On it." with nothing useful
+    return sentences.join(' ');
+  }
+
+  // =========================================================================
+  // Trivial task pre-classifier — instant execution, no Claude call
+  // =========================================================================
+
+  async _handleTrivialTask(text) {
+    const lower = text.toLowerCase().trim();
+
+    // "open [app]" — focus or launch via Start menu
+    const openMatch = lower.match(/^(?:open|launch|start|switch to|go to|bring up)\s+(.+)$/);
+    if (openMatch) {
+      const appName = openMatch[1].replace(/[.!?]/g, '').trim();
+
+      // Try focus_window first
+      if (this.computer && typeof this.computer.focusWindow === 'function') {
+        const fw = await this.computer.focusWindow(appName).catch(() => ({ ok: false }));
+        if (fw.ok) {
+          console.log(`[agent] Trivial: focused "${fw.title}"`);
+          this._lastFocusedWindow = appName;
+          return { text: '' }; // silent success
+        }
+      }
+
+      // Fallback: Win key → type → Enter
+      if (this.computer) {
+        await this.computer.key('win');
+        await new Promise(r => setTimeout(r, 500));
+        await this.computer.type(appName);
+        await new Promise(r => setTimeout(r, 300));
+        await this.computer.key('enter');
+        console.log(`[agent] Trivial: launched "${appName}" via Start menu`);
+        return { text: '' };
+      }
+    }
+
+    // "close [app]" — not trivial, needs confirmation
+    // "what do you know about me?" — profile question, let Claude handle with profile
+    // Everything else → not trivial, send to Claude
+
+    return null;
+  }
+
+  // =========================================================================
   // Main entry point
   // =========================================================================
 
@@ -347,6 +445,13 @@ class Agent {
       return trainCmd;
     }
 
+    // TRIVIAL task pre-classifier — handle instantly without calling Claude
+    const trivialResult = await this._handleTrivialTask(text);
+    if (trivialResult) {
+      console.timeEnd('[agent] chat total');
+      return trivialResult;
+    }
+
     // Check for precision hints → upgrade model
     if (/look carefully|be precise|be accurate|look closer|try harder/i.test(text)) {
       this._currentModel = MODEL_ACCURATE;
@@ -363,7 +468,16 @@ class Agent {
 
     let contextText = ctx;
     if (memoryContext) contextText += `\n\n${memoryContext}`;
-    if (enrichmentContext) contextText += enrichmentContext;
+    if (enrichmentContext) {
+      contextText += enrichmentContext;
+      // Speak the most important enrichment insight immediately
+      // Don't wait for Claude -- deliver the proactive flag NOW
+      const insightLine = this._extractTopInsight(enrichmentContext);
+      if (insightLine) {
+        console.log(`[agent] ENRICHMENT SPEAKS: "${insightLine.slice(0, 150)}"`);
+        this.onProgress({ type: 'text', text: insightLine });
+      }
+    }
     if (this._trainingMode) {
       contextText += '\n\n[TRAINING MODE ACTIVE: User is evaluating your performance. Execute the task as well as you can. Be proactive where appropriate. The user will rate you after.]';
     }
@@ -417,6 +531,11 @@ class Agent {
     while (true) {
       if (this._aborted) return { text: '' };
       iterations++;
+      // Auto-upgrade to Sonnet if Haiku is struggling (too many iterations)
+      if (iterations === UPGRADE_AFTER_ITERATIONS && this._currentModel === MODEL_FAST && MODEL_FAST !== MODEL_ACCURATE) {
+        this._currentModel = MODEL_ACCURATE;
+        console.log(`[agent] Upgrading to ${MODEL_ACCURATE} (Haiku took ${iterations} iterations)`);
+      }
       console.log(`[agent] --- Iteration ${iterations} (model: ${this._currentModel}) ---`);
       console.time(`[agent] iteration-${iterations}`);
 
@@ -439,16 +558,21 @@ class Agent {
         return { text: finalText };
       }
 
-      // Filter narration — Jarvis should act silently on trivial tasks
+      // Filter narration — WHITELIST approach: only speak if it contains real results
       if (textParts.length > 0) {
         const combined = textParts.join('\n').trim();
-        // Kill ALL filler phrases — these waste voice time
-        const isNarration = /^(let me|i('ll| will)|now i|ok(ay)?[,.]?\s|trying to|sure[,!]?\s|i('m| am) going|i can see|i need to|i see |looking at|it looks like|good[,!]|perfect[,!]|great[,!]|alright[,!]|excellent|that('s| is) the wrong|still on|let me (try|find|look|click|check|use|navigate|open|switch|press|type)|i('ll| will) (try|find|look|click|check|use|navigate|open|switch)|that opened|i don't see|i can see|the (page|tab|window) (still|is)|now let me|i need (to|clarity)|what (would you|are you|do you|specifically)|are you:|give me the)/i.test(combined);
-        // Also kill multi-paragraph "what do you want" responses
-        const isQuestion = /\?\s*\n|are you[:\n]|give me the|you still haven't/i.test(combined) && toolUses.length === 0;
-        if (combined && !isNarration && !isQuestion) {
+        // Only speak if the text contains actual useful content for the user
+        const hasResult = /\$\d|found|booked|sent|done|confirmed|scheduled|saved|created|deleted|here'?s your|recommend|heads up|fyi|warning|conflict|deadline/i.test(combined);
+        const hasQuestion = /\?\s*$/.test(combined) && !/let me|should i|do you want me/i.test(combined); // real question, not narration
+        const isShort = combined.length < 80 && !/let me|i('ll| will|'m going)|trying|looking|clicking|searching|opening|typing|waiting|loading|screenshot/i.test(combined);
+        const shouldSpeak = (hasResult || hasQuestion || isShort) && toolUses.length === 0;
+
+        if (combined && shouldSpeak) {
+          console.log(`[agent] SPEAKS: "${combined.slice(0, 120)}"`);
           this.onProgress({ type: 'text', text: combined });
           spokenTexts.push(combined);
+        } else if (combined) {
+          console.log(`[agent] FILTERED: "${combined.slice(0, 120)}"`);
         }
       }
 
@@ -673,7 +797,7 @@ class Agent {
 
     switch (action) {
       case 'screenshot': {
-        return await this._captureScreenshot();
+        return await this._captureScreenshot(false); // Skip OCR — Sonnet reads screenshots natively
       }
 
       case 'left_click': {
@@ -1031,14 +1155,21 @@ class Agent {
   _callAPI() {
     this._validateHistory();
 
+    // Inject user profile directly into system prompt so it's always front and center
+    let systemWithProfile = SYSTEM_PROMPT;
+    if (this.memory && this.memory.userProfile) {
+      systemWithProfile += `\n\n[USER PROFILE — you KNOW this person:]\n${this.memory.userProfile}`;
+    }
+
+    this._apiAbortController = new AbortController();
     return this.client.beta.messages.create({
       model: this._currentModel,
       max_tokens: MAX_TOKENS,
-      system: SYSTEM_PROMPT,
+      system: systemWithProfile,
       tools: this._getTools(),
       messages: this.history,
       betas: ['computer-use-2025-01-24'],
-    });
+    }, { signal: this._apiAbortController.signal });
   }
 
   _validateHistory() {
@@ -1126,6 +1257,10 @@ class Agent {
   abort() {
     this._aborted = true;
     this._runLoopActive = false;
+    if (this._apiAbortController) {
+      this._apiAbortController.abort();
+      this._apiAbortController = null;
+    }
     this.history = [];
     this.toolCallHistory = [];
     console.log('[agent] Aborted by user');

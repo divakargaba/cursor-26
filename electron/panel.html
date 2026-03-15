@@ -53,6 +53,15 @@
     -webkit-app-region:drag;
   }
   #orb-hero-canvas:active { cursor:grabbing; }
+  #btn-orb-stop {
+    display:none; position:absolute; bottom:8px; left:50%; transform:translateX(-50%);
+    width:28px; height:28px; border-radius:50%; border:2px solid rgba(248,113,113,0.8);
+    background:rgba(248,113,113,0.2); color:#f87171; font-size:12px;
+    cursor:pointer; z-index:20; -webkit-app-region:no-drag;
+    backdrop-filter:blur(4px); transition:all 0.15s;
+  }
+  #btn-orb-stop:hover { background:rgba(248,113,113,0.5); transform:translateX(-50%) scale(1.1); }
+  #btn-orb-stop.visible { display:flex; align-items:center; justify-content:center; }
   #orb-bg-glow {
     position:absolute; width:220px; height:220px;
     border-radius:50%; pointer-events:none; z-index:1;
@@ -334,6 +343,7 @@
   <div id="orb-bg-gradient"></div>
   <div id="orb-bg-glow"></div>
   <canvas id="orb-hero-canvas"></canvas>
+  <button id="btn-orb-stop" title="Stop Jarvis">&#x25A0;</button>
 </div>
 
 <!-- ═══ STAGE 2: FULL PANEL ═══ -->
@@ -770,7 +780,20 @@ heroCanvas.addEventListener('mouseup', (e) => {
   const dx = Math.abs(e.screenX - _orbDown.x), dy = Math.abs(e.screenY - _orbDown.y);
   const dt = Date.now() - _orbDown.t;
   _orbDown = null;
-  if (dx < 5 && dy < 5 && dt < 300) expandToPanel();
+  if (dx < 5 && dy < 5 && dt < 300) {
+    // If agent is busy or speaking — click = abort
+    if (_voiceCommandBusy || _ttsAudio || (window.speechSynthesis && window.speechSynthesis.speaking)) {
+      window.aiAssistant.abortAgent();
+      stopSpeaking();
+      _voiceCommandBusy = false;
+      voiceOnlyMode = false;
+      hideTyping();
+      setOrbState('idle');
+      console.log('[orb] Click-to-stop');
+    } else {
+      expandToPanel();
+    }
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -897,28 +920,63 @@ function setOrbState(state) {
   const labels={idle:'Ready',listening:'Listening',thinking:'Thinking',speaking:'Speaking',error:'Error',alert:'Alert'};
   statusLabelEl.textContent=labels[s]||labels.idle;
   inputArea.classList.toggle('glow',s==='listening');
+  // Show stop button when agent is thinking or speaking
+  const stopBtn=document.getElementById('btn-orb-stop');
+  if(stopBtn) stopBtn.classList.toggle('visible', s==='thinking'||s==='speaking');
   setAmbientState(s);
   setOrbConfig(s);
   window.aiAssistant.setTrayState(s);
 }
 
 function stopSpeaking(){
-  if(window.speechSynthesis&&window.speechSynthesis.speaking){
-    window.speechSynthesis.cancel();
-    setOrbState('idle');
-    window.aiAssistant.reportTTSState(false);
-  }
+  if(_ttsAudio){_ttsAudio.pause();_ttsAudio=null;}
+  if(window.speechSynthesis&&window.speechSynthesis.speaking) window.speechSynthesis.cancel();
+  setOrbState('idle');
+  window.aiAssistant.reportTTSState(false);
+  if(typeof alwaysOn!=='undefined')alwaysOn.setTTSSpeaking(false);
 }
 
+let _ttsAudio=null; // current ElevenLabs audio element
+
 function speak(text) {
-  if(!ttsEnabled||!window.speechSynthesis)return;
-  window.speechSynthesis.cancel();
+  if(!ttsEnabled)return;
+  // Stop any current audio
+  stopSpeaking();
+  if(!text||!text.trim())return;
+
+  setOrbState('speaking');
+  window.aiAssistant.reportTTSState(true);
+  if(typeof alwaysOn!=='undefined')alwaysOn.setTTSSpeaking(true);
+
+  // ElevenLabs TTS (async, with speechSynthesis fallback)
+  window.aiAssistant.elevenLabsTTS(text).then(r=>{
+    if(r.ok){
+      _ttsAudio=new Audio('data:audio/mpeg;base64,'+r.audioBase64);
+      _ttsAudio.onended=()=>{_ttsFinished();};
+      _ttsAudio.onerror=()=>{_ttsFinished();};
+      _ttsAudio.play().catch(()=>{_ttsFinished();});
+    } else {
+      // Fallback to browser speechSynthesis
+      console.log('[tts] ElevenLabs failed, using fallback:',r.error);
+      _speakFallback(text);
+    }
+  }).catch(()=>{_speakFallback(text);});
+}
+
+function _ttsFinished(){
+  _ttsAudio=null;
+  setOrbState('idle');
+  window.aiAssistant.reportTTSState(false);
+  if(typeof alwaysOn!=='undefined')alwaysOn.setTTSSpeaking(false);
+}
+
+function _speakFallback(text){
+  if(!window.speechSynthesis)return;
   const u=new SpeechSynthesisUtterance(text);u.rate=1.1;u.pitch=1.0;u.volume=1.0;
   const v=window.speechSynthesis.getVoices();
   const pref=v.find(v=>v.name.includes('Microsoft Zira')||v.name.includes('Microsoft David')||v.name.includes('Google'));
   if(pref)u.voice=pref;
-  u.onstart=()=>{setOrbState('speaking');window.aiAssistant.reportTTSState(true);};
-  u.onend=()=>{setOrbState('idle');window.aiAssistant.reportTTSState(false);};
+  u.onend=()=>{_ttsFinished();};
   window.speechSynthesis.speak(u);
 }
 
@@ -1054,6 +1112,18 @@ const voice=new VoiceInput({
   onError:m=>{if(panelMode==='panel')addMessage('assistant',m);setOrbState('idle');},
 });
 micBtn.addEventListener('click',()=>voice.toggle());
+
+// Stop button on orb — click to abort agent + stop speaking
+document.getElementById('btn-orb-stop').addEventListener('click',(e)=>{
+  e.stopPropagation();
+  window.aiAssistant.abortAgent();
+  stopSpeaking();
+  _voiceCommandBusy=false;
+  voiceOnlyMode=false;
+  hideTyping();
+  setOrbState('idle');
+  console.log('[orb] Stop button clicked');
+});
 
 // Always-on "Hey Jarvis" wake word listener
 const aoBtn=document.getElementById('btn-always-on');

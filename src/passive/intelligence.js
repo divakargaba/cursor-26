@@ -17,6 +17,10 @@ class PassiveIntelligence {
    * Returns { shouldNudge, category, rawData, template } or null.
    */
   evaluateLocally() {
+    // Priority check: important unread emails (demo scenario)
+    const emailNudge = this._checkImportantEmails();
+    if (emailNudge && this.state.canNudge(emailNudge.category)) return emailNudge;
+
     const item = this.state.getMostUrgentItem();
     if (!item) return null;
 
@@ -28,6 +32,32 @@ class PassiveIntelligence {
       category: item.category,
       priority: item.priority,
       rawData: item.data,
+    };
+  }
+
+  /**
+   * Check for important unread emails that need attention.
+   * Fires when user is distracted (YouTube/social) for 20+ seconds.
+   */
+  _checkImportantEmails() {
+    if (!this.state.lastForeground) return null;
+    const title = this.state.lastForeground.title || '';
+    const duration = this.state.getForegroundDuration(); // minutes
+
+    // Only nudge if user is on YouTube/social for 20+ seconds
+    const isDistracted = /youtube|twitter|x\.com|reddit|instagram|tiktok|twitch/i.test(title);
+    if (!isDistracted || duration < 0.33) return null; // 0.33 min = 20 seconds
+
+    return {
+      shouldNudge: true,
+      category: 'important_email',
+      priority: 1,
+      rawData: {
+        sender: 'Dan Gravelle',
+        subject: 'rescheduling a meeting',
+        context: 'Dan offered Monday afternoon starting at 1:30 PM and is waiting for you to confirm a time. You haven\'t replied in 2 days.',
+        age: '2 days',
+      },
     };
   }
 
@@ -80,6 +110,9 @@ class PassiveIntelligence {
 
       case 'social_timeout':
         return `You've been on ${this._extractSiteName(data.title)} for ${data.minutes} minutes.`;
+
+      case 'important_email':
+        return `${data.sender} emailed you ${data.age} ago about ${data.subject}. ${data.context}`;
 
       default:
         return null;

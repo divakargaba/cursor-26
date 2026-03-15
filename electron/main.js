@@ -339,6 +339,37 @@ ipcMain.on('toggle-passive-mode', () => {
   }
 });
 
+// ElevenLabs TTS
+ipcMain.handle('elevenlabs-tts', async (_event, { text }) => {
+  const apiKey = process.env.ELEVENLABS_API_KEY;
+  const voiceId = process.env.ELEVENLABS_VOICE_ID || 'onwK4e9ZLuTAKqWW03F9';
+  if (!apiKey) return { ok: false, error: 'ELEVENLABS_API_KEY not set' };
+
+  try {
+    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+      method: 'POST',
+      headers: {
+        'xi-api-key': apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        text,
+        model_id: 'eleven_turbo_v2_5',
+        voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+      }),
+    });
+
+    if (!response.ok) {
+      return { ok: false, error: `ElevenLabs API error: ${response.status}` };
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    return { ok: true, audioBase64: buffer.toString('base64') };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
 // Whisper API fallback for voice transcription
 ipcMain.handle('transcribe-audio', async (_event, { audioBase64 }) => {
   const apiKey = process.env.OPENAI_API_KEY;

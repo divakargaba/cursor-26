@@ -7,7 +7,7 @@ const Scanner = require('./scanner');
 const PassiveIntelligence = require('./intelligence');
 const PassiveDelivery = require('./delivery');
 
-const DEFAULT_INTERVAL = 30000; // 30 seconds
+const DEFAULT_INTERVAL = 10000; // 10 seconds — fast scanning for demo responsiveness
 
 class PassiveMonitor {
   /**
@@ -98,23 +98,23 @@ class PassiveMonitor {
     this._tickCount++;
 
     try {
-      // 1. Check browser connection
-      if (!this.browser || typeof this.browser.isConnected !== 'function' || !this.browser.isConnected()) {
-        this._running = false;
-        return;
-      }
+      // Scan foreground window (works without CDP via Win32)
+      // Tabs + activeContent only if browser CDP is connected
+      const browserOk = this.browser && typeof this.browser.isConnected === 'function' && this.browser.isConnected();
 
-      // 2. Scan in parallel: tabs + activeContent + foreground
       const [tabs, activeContent, foreground] = await Promise.all([
-        this.scanner.scanTabs().catch(() => null),
-        this.scanner.scanActiveContent().catch(() => null),
+        browserOk ? this.scanner.scanTabs().catch(() => null) : null,
+        browserOk ? this.scanner.scanActiveContent().catch(() => null) : null,
         Promise.resolve(this.scanner.scanForeground()),
       ]);
 
       // 3. Update state with scan results
       if (tabs) this.state.updateTabs(tabs);
       if (activeContent) this.state.updateActiveContent(activeContent);
-      if (foreground) this.state.updateForeground(foreground);
+      if (foreground) {
+        this.state.updateForeground(foreground);
+        if (this._tickCount % 3 === 0) console.log(`[passive] Foreground: "${foreground.title?.slice(0, 60)}"`);
+      }
 
       // 4. Evaluate locally — anything worth mentioning?
       const evaluation = this.intelligence.evaluateLocally();

@@ -58,7 +58,8 @@
       "Bash(git show:*)",
       "Bash(npx jest:*)",
       "Bash(tasklist:*)",
-      "Bash(source:*)"
+      "Bash(source:*)",
+      "WebFetch(domain:api.elevenlabs.io)"
     ]
   }
 }

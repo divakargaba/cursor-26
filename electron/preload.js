@@ -74,6 +74,9 @@ contextBridge.exposeInMainWorld('aiAssistant', {
   abortAgent: () =>
     ipcRenderer.send('abort-agent'),
 
+  elevenLabsTTS: (text) =>
+    ipcRenderer.invoke('elevenlabs-tts', { text }),
+
   onPassiveNudge: (callback) => {
     ipcRenderer.on('passive-nudge', (_event, data) => callback(data));
   },
