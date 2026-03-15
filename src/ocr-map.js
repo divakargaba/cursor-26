@@ -25,44 +25,55 @@ async function getWorker() {
 async function buildOCRMap(imgBuffer) {
     try {
         const worker = await getWorker();
-        const result = await worker.recognize(imgBuffer);
+        const result = await worker.recognize(imgBuffer, {}, { blocks: true });
 
         // Build hashmap: { "send": {centerX, centerY, w, h, raw}, ... }
         const map = {};
+        const blocks = result.data.blocks || [];
 
-        // Index by individual words
-        for (const word of result.data.words) {
-            if (word.confidence < 50) continue; // skip low confidence
-            if (word.text.trim().length < 2) continue; // skip single chars
+        // Index by individual words (tesseract.js v7: blocks → paragraphs → lines → words)
+        for (const block of blocks) {
+            for (const paragraph of block.paragraphs || []) {
+                for (const line of paragraph.lines || []) {
+                    for (const word of line.words || []) {
+                        if (word.confidence < 50) continue;
+                        if (word.text.trim().length < 2) continue;
 
-            const label = word.text.trim().toLowerCase();
-            map[label] = {
-                x: word.bbox.x0,
-                y: word.bbox.y0,
-                w: word.bbox.x1 - word.bbox.x0,
-                h: word.bbox.y1 - word.bbox.y0,
-                centerX: Math.round((word.bbox.x0 + word.bbox.x1) / 2),
-                centerY: Math.round((word.bbox.y0 + word.bbox.y1) / 2),
-                confidence: word.confidence,
-                raw: word.text.trim()
-            };
+                        const label = word.text.trim().toLowerCase();
+                        map[label] = {
+                            x: word.bbox.x0,
+                            y: word.bbox.y0,
+                            w: word.bbox.x1 - word.bbox.x0,
+                            h: word.bbox.y1 - word.bbox.y0,
+                            centerX: Math.round((word.bbox.x0 + word.bbox.x1) / 2),
+                            centerY: Math.round((word.bbox.y0 + word.bbox.y1) / 2),
+                            confidence: word.confidence,
+                            raw: word.text.trim()
+                        };
+                    }
+                }
+            }
         }
 
         // Also index by whole lines (for multi-word labels like "New Message")
-        for (const line of result.data.lines) {
-            const text = line.text.trim().toLowerCase();
-            if (text.length < 3) continue;
+        for (const block of blocks) {
+            for (const paragraph of block.paragraphs || []) {
+                for (const line of paragraph.lines || []) {
+                    const text = line.text.trim().toLowerCase();
+                    if (text.length < 3) continue;
 
-            map[text] = {
-                x: line.bbox.x0,
-                y: line.bbox.y0,
-                w: line.bbox.x1 - line.bbox.x0,
-                h: line.bbox.y1 - line.bbox.y0,
-                centerX: Math.round((line.bbox.x0 + line.bbox.x1) / 2),
-                centerY: Math.round((line.bbox.y0 + line.bbox.y1) / 2),
-                confidence: line.confidence,
-                raw: line.text.trim()
-            };
+                    map[text] = {
+                        x: line.bbox.x0,
+                        y: line.bbox.y0,
+                        w: line.bbox.x1 - line.bbox.x0,
+                        h: line.bbox.y1 - line.bbox.y0,
+                        centerX: Math.round((line.bbox.x0 + line.bbox.x1) / 2),
+                        centerY: Math.round((line.bbox.y0 + line.bbox.y1) / 2),
+                        confidence: line.confidence,
+                        raw: line.text.trim()
+                    };
+                }
+            }
         }
 
         return map;

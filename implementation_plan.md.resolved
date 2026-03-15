@@ -1,0 +1,85 @@
+# The "Self-Operating" Master Plan: MCP + OCR + SOM
+
+This plan combines two massive upgrades to make the AI assistant fast, reliable, and exactly like the *Self-Operating Computer* videos you saw, but built natively in your Electron app so it's much faster.
+
+## Part 1: Chrome Control → Switch to Chrome DevTools MCP
+Instead of Playwright (heavy) or raw CDP clicking (unreliable), we use the official Anthropic Chrome DevTools MCP server.
+
+**Why:** It natively understands how to find and click elements even if they are hidden, handles Chrome lifecycle, and uses `<1000` tokens per page read (via Accessibility Trees instead of raw DOM).
+
+**Implementation:**
+1. Create `src/mcp-browser.js` that spawns `npx chrome-devtools-mcp@latest` as a subprocess.
+2. Communicate via JSON-RPC over stdio.
+3. Map [agent.js](file:///c:/Users/omara/ai-assistant/src/agent.js)'s `browser_action` to MCP tools (`navigate_page`, `take_snapshot`, `click`, `fill`, `press_key`).
+4. Remove `playwright` dependency entirely.
+
+*(Note: The exact code for this was in the previous implementation plan.)*
+
+---
+
+## Part 2: Native App Control → OCR & SOM (The Secret Sauce)
+
+When outside the browser, predicting raw X/Y coordinates from a screenshot is impossible for an LLM to do accurately. We will build the *Self-Operating Computer* methodology directly into Node.js.
+
+### Method A: OCR Clicking (`click_text`)
+Instead of the AI guessing where a word is, it just tells the system what word it wants to click.
+
+1. **Install Tesseract.js**: `npm install tesseract.js` (runs fully local, very fast).
+2. **New Agent Tool Action**: Add `ocr_click` to `native_action`.
+   - Payload: `{ action: "ocr_click", text: "Settings" }`
+3. **Execution in [agent.js](file:///c:/Users/omara/ai-assistant/src/agent.js)**:
+   - Take a screenshot.
+   - Run Tesseract.js on the screenshot buffer to get bounding boxes of all words.
+   - Find the bounding box matching "Settings".
+   - Calculate the center X/Y of that box.
+   - Call `computer.leftClick(X, Y)`.
+
+```js
+// Example OCR execution logic
+const { createWorker } = require('tesseract.js');
+const worker = await createWorker('eng');
+const ret = await worker.recognize(screenshotBuffer);
+const wordBox = ret.data.words.find(w => w.text.toLowerCase() === targetText.toLowerCase());
+if (wordBox) {
+  const x = wordBox.bbox.x0 + (wordBox.bbox.x1 - wordBox.bbox.x0) / 2;
+  const y = wordBox.bbox.y0 + (wordBox.bbox.y1 - wordBox.bbox.y0) / 2;
+  await computer.leftClick(x, y);
+}
+```
+
+### Method B: Set-Of-Mark (SOM) Tagging for Icons
+OCR works for text, but what about icon buttons (like a ⚙️ gear icon or a ➕ plus sign)? We need SOM (Set of Mark) tag overlays.
+
+Instead of running a heavy YOLO model locally (which requires PyTorch and kills Electron performance), we use a lighter OpenCV.js or pure Node.js approach to find UI element contours (distinct shapes).
+
+1. **Edge Detection / Contours**: Use a fast edge/contour detection algorithm on the screenshot to find distinct isolated UI elements (icons, buttons).
+2. **Draw Tags**: For every detected element, draw a solid colored box with a number inside (e.g., "[ 14 ]") directly onto the screenshot *before* sending it to Claude.
+3. **New Agent Tool Action**: Add `tag_click` to `native_action`.
+   - Payload: `{ action: "tag_click", label: "14" }`
+4. **Execution**:
+   - The system maintains a memory map of `Tag ID -> Center X/Y Tuple` for the current screenshot.
+   - When the agent says "click 14", the system looks up tag 14's coordinates and clicks it.
+
+### Step-by-Step Build Order for Claude Code
+
+**PR 1: The Browser Upgrade (High impact, fast)**
+- Build `src/mcp-browser.js`.
+- Update [electron/main.js](file:///c:/Users/omara/ai-assistant/electron/main.js) to spawn it.
+- Update [agent.js](file:///c:/Users/omara/ai-assistant/src/agent.js)'s [_execBrowserAction](file:///c:/Users/omara/ai-assistant/src/agent.js#508-609) to route to MCP methods.
+- Uninstall Playwright.
+
+**PR 2: The OCR Upgrade (Medium effort, massive native app boost)**
+- `npm install tesseract.js`
+- Create `src/ocr.js` with a persistent Tesseract worker (so it doesn't take 3 seconds to load every time).
+- Add `ocr_click` to the `native_action` schema.
+- Implement the OCR search-and-click logic in [_execNativeAction](file:///c:/Users/omara/ai-assistant/src/agent.js#612-805).
+
+**PR 3: The SOM Tagging Upgrade (High effort, solves the icon problem)**
+- Create `src/som.js` to process screenshots and find clickable bounds (can use `jimp` or a lightweight `opencv4nodejs-prebuilt` wrapper).
+- Update the screenshot loop so if the agent requests `take_som_screenshot`, it returns the tagged image.
+- Add `tag_click` to the `native_action` schema. 
+
+## Why this is better than the Python version
+1. The Python version uses `time.sleep(1)` everywhere and spawns OCR per-click. We will keep Tesseract loaded in memory via a worker thread -> instant OCR clicks.
+2. The Python version uses YOLO for SOM (heavy, slow cold start). We can use fast contour detection.
+3. Your app retains the floating voice UI and instant Chrome CDP speeds, getting the best of both worlds.

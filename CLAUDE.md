@@ -1,44 +1,53 @@
 # ai-assistant: Project Knowledge & AI Memory
 
-This file serves as the permanent memory for Claude Code. 
+This file serves as the permanent memory for Claude Code.
 When picking up new tasks or resolving bugs, consult these rules first.
 
-## 🏗️ Architecture Stack
-1. **Electron Shell:** Overlay UI (`electron/overlay.html`), system shortcuts, and window management (`electron/main.js`).
-2. **AI Engine:** Claude Haiku (`src/agent.js`) driving the logic loop.
+## Architecture Stack
+1. **Electron Shell:** Overlay UI (`electron/panel.html`), system shortcuts, and window management (`electron/main.js`).
+2. **AI Engine:** Claude computer-use API (`src/agent.js`) — hybrid tool setup.
+   - **Native computer-use tool** (`computer_20250124`): Claude analyzes screenshots, returns pixel coordinates for clicks. Trained for this.
+   - **CDP browser tool** (`browser_action`): Chrome DevTools Protocol for web pages — faster than screenshot clicking.
+   - **Confirmation tool** (`request_confirmation`): Safety gate for destructive actions.
+   - **Dynamic model switching:** Haiku 4.5 (fast, default) → Sonnet 4.6 (accurate, on retry/failure).
 3. **Computer Control:** Direct Windows API integration via Koffi (`src/computer.js`).
-   - *CRITICAL:* All coordinates must use standard `SetCursorPos` coordinate space derived from `GetSystemMetrics(SM_CXSCREEN)`. 
-   - Never use physical pixels or raw image pixels without scaling them.
-4. **Browser Control:** Chrome DevTools MCP via stdio (`src/mcp-browser.js`).
-   - Replaced Playwright. Uses native DevTools protocol.
-5. **Vision & Grid:** `desktop-screenshot` with custom grid overlay annotation (`src/grid-overlay.js`).
+   - Uses `SetPhysicalCursorPos` for mouse, `keybd_event` for keyboard.
+   - Coordinate scaling: Claude sends coords in display space (1024xN), we multiply by scale factor → physical pixels.
+4. **Browser Control:** Chrome CDP via Playwright (`src/browser.js`).
+   - Auto-connects to Chrome with `--remote-debugging-port=9222`.
+   - Also supports Electron app CDP (Discord, Spotify, etc.).
+5. **Screenshot Pipeline:** `desktopCapturer` → `nativeImage.resize()` → JPEG quality 50 → base64.
+   - Physical screen (e.g. 1920x1080) downscaled to ~1024x576 (max 1024px long edge).
+   - Scale factors stored in `displayConfig` for coordinate mapping.
 
-## 🛑 Hard Rules & Mistake Prevention
-*(Update this section ruthlessly whenever Claude makes a mistake twice)*
+## Hard Rules & Mistake Prevention
 
-### 1. Browser & CDP
-- **NEVER use Playwright.** It has been removed. Use `mcp-browser.js`.
-- **Discord Selectors:** 
-  - To type a message: `[data-slate-editor="true"]` or `[aria-label*="Message"]`. 
-  - Do NOT use `textarea` (matches the search bar).
-- **Element Clicks:** MCP `click` handles visibility checks. If elements are hidden, use keyboard shortcuts instead.
+### 1. Computer-Use Coordinates
+- Claude returns coordinates in **display space** (e.g. 1024x576).
+- `agent.js _scaleToPhysical()` multiplies by `scaleX`/`scaleY` → physical pixels.
+- **NEVER double-scale.** `computer.js` uses physical coords directly via `SetPhysicalCursorPos`.
+- Auto-screenshot after every action (click/type/key/scroll) — Claude sees the result immediately.
 
-### 2. Native Computer Control (agent.js)
-- **Focus Before Typing:** ALWAYS call `focus_window("AppName")` before sending keystrokes or types. Otherwise, input goes to the void or the wrong app.
-- **NEVER Guess Coordinates:** The agent cannot "see" pixel offsets. Always use:
-  1. `browser_action` with CSS selectors (for Chrome).
-  2. `read_screen` to get UIAutomation element names.
-  3. `take_screenshot` then click a grid cell like `cell="F4"`.
-- **Keyboard Shortcuts > Clicks:** Use `ctrl+k` for Discord/Slack quick switcher, `explorer.exe` for files. It's 10x more reliable than computer vision.
+### 2. Browser & CDP
+- `browser_action` is for **web pages** — faster than screenshot→click cycle.
+- Discord/Slack: prefer keyboard shortcuts (`ctrl+k` quick switcher) over clicking.
+- CDP auto-connects to Chrome on port 9222. Electron apps on other ports (9224=Discord, etc).
 
-### 3. Coordinate Math (grid-overlay.js)
-- Screenshots are returned in physical display pixels (e.g. 1920x1080).
-- Windows `SetCursorPos` uses a virtual coordinate space (`GetSystemMetrics`).
-- `grid-overlay.js` maps image pixels to the screen metrics scale. Do not double-scale coordinates in `computer.js`.
+### 3. Model Switching
+- **Default: Haiku 4.5** — fast, cheap, good enough for most tasks.
+- **Auto-upgrade to Sonnet 4.6** when:
+  - Screenshot unchanged after 3+ actions (nothing happened).
+  - User says "look carefully", "be precise", etc.
+- Model resets to Haiku on `clearHistory()`.
+
+### 4. Deleted Components (do NOT recreate)
+- `src/grid-overlay.js` — **DELETED.** Claude's native computer-use replaces grid cells.
+- `native_action` tool — **REMOVED.** Replaced by `computer` tool (computer-use API).
+- `take_screenshot` tool — **REMOVED.** `computer` tool handles screenshots.
 
 ---
 
-## 🚀 Claude Code Best Practices (The Evolving AI Way)
+## Claude Code Best Practices
 
 ### 1. Plan Mode First
 For any task larger than a 1-line bug fix:
@@ -46,21 +55,10 @@ For any task larger than a 1-line bug fix:
 2. Outline the files changing and the exact sequence.
 3. Once the plan looks solid, switch back to execution.
 
-### 2. Parallel Worktrees
-Don't get stuck waiting for Claude. If one agent is refactoring `agent.js`:
-```bash
-git worktree add ../mcp-branch
-cd ../mcp-branch && claude
-```
-Run independent tasks (like CSS tweaking and backend logic) in parallel.
+### 2. Update This File
+After EVERY resolved bug or architectural decision, add the lesson learned here.
 
-### 3. Update This File
-After EVERY resolved bug or architectural decision, add the lesson learned here with the prompt:
-> *"Update your CLAUDE.md so you don't make that mistake again."*
-
-### 4. Custom Skill Commands
-Save repetitive debug workflows as skills. For example, to check the Electron logs quickly:
-```bash
-# Example custom skill setup (to be built):
-# /logs -> tails the last 50 lines of electron output
-```
+### 3. Beta API
+- Computer-use requires `betas: ["computer-use-2025-01-24"]` header.
+- Uses `client.beta.messages.create()` not `client.messages.create()`.
+- Tool type: `computer_20250124` (not a custom tool schema).

@@ -39,6 +39,12 @@ const GetWindowTextLengthA = user32.func('int __stdcall GetWindowTextLengthA(voi
 const GetWindowThreadProcessId = user32.func('uint32_t __stdcall GetWindowThreadProcessId(void *hWnd, uint32_t *lpdwProcessId)');
 const AttachThreadInput = user32.func('bool __stdcall AttachThreadInput(uint32_t idAttach, uint32_t idAttachTo, bool fAttach)');
 const GetCurrentThreadId = kernel32.func('uint32_t __stdcall GetCurrentThreadId()');
+const BringWindowToTop = user32.func('bool __stdcall BringWindowToTop(void *hWnd)');
+const SetWindowPos = user32.func('bool __stdcall SetWindowPos(void *hWnd, intptr_t hWndInsertAfter, int X, int Y, int cx, int cy, uint32_t uFlags)');
+const HWND_TOPMOST = -1;
+const HWND_NOTOPMOST = -2;
+const SWP_NOMOVE = 0x0002;
+const SWP_NOSIZE = 0x0001;
 
 // EnumWindows callback
 const EnumWindowsProc = koffi.proto('bool __stdcall EnumWindowsProc(void *hwnd, intptr_t lParam)');
@@ -127,9 +133,9 @@ class Computer {
    */
   _ensureTargetFocused() {
     if (!this._lastFocusedHwnd) return;
-    // Alt trick: briefly press/release Alt to unlock SetForegroundWindow
-    keybd_event(0x12, 0, 0, 0);
-    keybd_event(0x12, 0, KEYEVENTF_KEYUP, 0);
+    // Ctrl press/release to unlock SetForegroundWindow (NOT Alt — triggers menu overlays)
+    keybd_event(0x11, 0, 0, 0);
+    keybd_event(0x11, 0, KEYEVENTF_KEYUP, 0);
     SetForegroundWindow(this._lastFocusedHwnd);
   }
 
@@ -385,14 +391,19 @@ class Computer {
       const targetThread = GetWindowThreadProcessId(match.hwnd, targetPidBuf);
       const curThread = GetCurrentThreadId();
 
-      // Alt trick first — unlocks SetForegroundWindow on modern Windows
-      keybd_event(0x12, 0, 0, 0);
-      keybd_event(0x12, 0, KEYEVENTF_KEYUP, 0);
+      // Ctrl press/release to generate input event — unlocks SetForegroundWindow.
+      // Do NOT use Alt — it triggers Access Key overlays in modern Windows apps.
+      keybd_event(0x11, 0, 0, 0);
+      keybd_event(0x11, 0, KEYEVENTF_KEYUP, 0);
 
       AttachThreadInput(curThread, fgThread, true);
       AttachThreadInput(curThread, targetThread, true);
       ShowWindow(match.hwnd, SW_RESTORE);
       SetForegroundWindow(match.hwnd);
+      BringWindowToTop(match.hwnd);
+      // Force to front: briefly set TOPMOST then remove — guarantees visibility
+      SetWindowPos(match.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+      SetWindowPos(match.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
       AttachThreadInput(curThread, targetThread, false);
       AttachThreadInput(curThread, fgThread, false);
 

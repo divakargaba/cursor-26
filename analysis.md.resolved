@@ -1,0 +1,118 @@
+# Deep Analysis: What's Broken + Competitor Lessons
+
+## 🔴 Critical Bugs Right Now
+
+### Bug 1: OCR Completely Broken
+```
+[ocr] Error building map: result.data.words is not iterable
+```
+**Every single screenshot fails OCR.** The Tesseract.js v5+ API changed — `result.data.words` is now nested differently. The [buildOCRMap](file:///c:/Users/omara/ai-assistant/src/ocr-map.js#20-74) function loops over `result.data.words` but the structure may be `result.data.paragraphs[].lines[].words[]`, or the `recognize()` call returns a different shape when given a raw buffer vs a file path. **Fix:** Add a guard and flatten the structure, or pin to a known-good Tesseract.js version.
+
+### Bug 2: MCP Chrome Opens a NEW Unauthenticated Browser
+The screenshot shows Gmail on the left (logged in, working) and a fresh Google sign-in page on the right with the banner **"Chrome is being controlled by automated testing software"**. This is because `chrome-devtools-mcp` spawns its own Puppeteer-managed Chrome instance — completely separate from the user's real Chrome profile. **All cookies, logins, extensions are gone.** This is the same problem Playwright had.
+
+**Fix:** MCP needs to connect to the user's *existing* Chrome via `--remote-debugging-port=9222`, not spawn a new one. Pass `--browser-url=http://localhost:9222` to the MCP server instead of `--executable-path`.
+
+### Bug 3: Focus-Switching Loop (Discord)
+The agent sees Discord, clicks on it, but accidentally clicks on VS Code or another window in front of it. It then takes a screenshot, sees Discord is gone, clicks on it again, overshoots, etc. This burns 6-8 iterations just trying to focus a window.
+
+**Root cause:** The agent uses `left_click` on the taskbar icon (imprecise) instead of using Windows API `SetForegroundWindow` to programmatically focus the window. There's no "verify focus" step.
+
+### Bug 4: Excessive Screenshots (Auto-screenshot after every action)
+Every `left_click`, [type](file:///c:/Users/omara/ai-assistant/src/computer.js#292-310), [key](file:///c:/Users/omara/ai-assistant/src/computer.js#311-322), and [scroll](file:///c:/Users/omara/ai-assistant/src/computer.js#281-287) action automatically calls [_captureScreenshot()](file:///c:/Users/omara/ai-assistant/src/agent.js#542-593) which takes ~1.5-4 seconds (screenshot + OCR attempt). With 12 iterations, that's 12 unnecessary screenshots minimum. Claude's computer-use API *requests* screenshots when it needs them — we don't need to force one after every action.
+
+**Fix:** Only return a screenshot when Claude explicitly calls `action: "screenshot"`. For click/type/key actions, return a text confirmation instead.
+
+### Bug 5: Haiku is Too Dumb for Desktop Navigation
+Haiku 4.5 is extremely fast but makes poor spatial decisions:
+- Clicks the wrong part of the taskbar
+- Can't distinguish similar-looking icons
+- Gets confused by overlapping windows
+- Doesn't plan multi-step sequences well
+
+Open-Interface, UI-TARS, and Self-Operating-Computer all use their most capable model for the vision loop. Speed comes from fewer iterations, not a weaker model.
+
+---
+
+## 🔍 Competitor Analysis
+
+### 1. [Open-Interface](https://github.com/AmberSahdev/Open-Interface) (GPT-4o)
+**Architecture:** Screenshot → GPT-4o → JSON instructions → pyautogui execute → repeat
+
+**What they do well:**
+- Dead simple loop: screenshot, ask LLM, execute, screenshot again
+- Uses GPT-4o (strong vision) — not a weak/fast model
+- User can interrupt anytime (Stop button or drag cursor to corner)
+
+**What they admit is broken:**
+> "Stuff It's Error-Prone At: Accurate spatial-reasoning and hence clicking buttons."
+
+**Lesson:** Even with GPT-4o, raw coordinate clicking is unreliable. They don't solve the click accuracy problem — they just accept the error rate. We need to be better.
+
+### 2. [UI-TARS Desktop](https://github.com/bytedance/UI-TARS-desktop) (ByteDance)
+**Architecture:** Their own fine-tuned vision model (UI-TARS-1.5) + Electron app + **hybrid browser strategy**
+
+**What they do well:**
+- **Hybrid Browser Agent**: Uses BOTH GUI Agent (screenshot-based clicking) AND DOM-based interaction. Falls back between them automatically.
+- **Custom vision model** trained specifically for UI element detection — not a general LLM trying to guess pixels
+- **MCP integration** for real-world tool connections
+- **Event Stream Protocol** for real-time feedback (not polling)
+
+**Key insight:** They use a fine-tuned model that *actually understands* UI element boundaries, not a general-purpose LLM. This is why their clicks are more accurate.
+
+**Lesson:** For us, since we can't train our own model, we need to **assist** Claude with structural data (OCR labels, DOM elements, accessibility tree) rather than sending raw screenshots and hoping.
+
+### 3. [webmarker](https://github.com/reidbarber/webmarker)
+**Architecture:** JavaScript library that marks interactive DOM elements with numbered labels + bounding boxes *before* screenshotting.
+
+**What they do well:**
+- Injects into the page, finds all interactive elements (`a`, `button`, `input`, `[role="button"]`, etc.)
+- Draws colored bounding boxes + number labels directly on the page
+- LLM just says "click 7" instead of guessing coordinates
+- Works with any vision-language model
+
+**Lesson:** This is the **SOM (Set-of-Mark)** approach done right for web pages. We should inject this into Chrome pages via CDP before taking screenshots. Claude would see labeled elements and never need to guess.
+
+### 4. [OpenAdapt](https://github.com/OpenAdaptAI/OpenAdapt)
+**Architecture:** Record human demos → train model to replay with variations
+
+**What they do well:**
+- Record-replay approach: learns from watching YOU do the task
+- Modular sub-packages (capture, ML, evals, privacy)
+- Uses accessibility tree data alongside screenshots
+
+**Lesson:** The accessibility tree approach is key. Windows UIAutomation can provide element names, types, and bounding rects without any vision model at all.
+
+---
+
+## 🎯 Root Cause Summary
+
+| Problem | Root Cause | Priority |
+|---------|-----------|----------|
+| OCR crash | Tesseract.js API mismatch | P0 — blocks all OCR |
+| Chrome not logged in | MCP spawns new Chrome instance | P0 — breaks all web tasks |
+| Focus loops | Using screenshot clicks instead of Win32 API | P1 — wastes 50% of iterations |
+| Slow execution | Auto-screenshot after every action | P1 — adds 2-4s per action |
+| Wrong clicks | Haiku too weak for spatial reasoning | P2 — use Sonnet for vision loop |
+
+---
+
+## 💡 Recommended Architecture (Combining Best Ideas)
+
+### Tier 1: Browser (CDP + webmarker-style SOM)
+1. Connect to user's **existing** Chrome (port 9222), not a new instance
+2. Inject a `webmarker`-style script via CDP to label interactive elements
+3. Send Claude the **labeled screenshot** + element list as text
+4. Claude says "click element 7" → we look up element 7's coordinates → click
+
+### Tier 2: Native Apps (Win32 UIAutomation + OCR fallback)
+1. **First try:** `UIAutomation` accessibility tree (element names, types, bounding rects) — free, instant, no vision needed
+2. **Fallback:** OCR scan (fix Tesseract.js) for apps with poor accessibility support
+3. **Last resort:** Claude's native computer-use pixel clicking (with Sonnet, not Haiku)
+
+### Tier 3: Speed Optimizations
+1. **No auto-screenshots.** Let Claude request them when needed
+2. **Parallel OCR:** Start OCR while waiting for Claude's API response
+3. **Use `SetForegroundWindow`** for window focus, not taskbar clicking
+4. **Batch actions:** Tell Claude to return multiple actions per turn
+5. **Use Sonnet 4** for the vision loop — fewer iterations > faster model per iteration
