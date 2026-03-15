@@ -276,6 +276,7 @@ class Agent {
     this.onProgress({ type: 'status', text: 'Reading context...' });
 
     this._currentActions = [];
+    this._chatStartTime = Date.now();
 
     // Check for precision hints → upgrade model
     if (/look carefully|be precise|be accurate|look closer|try harder/i.test(text)) {
@@ -285,14 +286,11 @@ class Agent {
 
     const ctx = await this._gatherContext();
 
-    // Get memory tips
-    let memoryTips = '';
+    // Get full memory context (playbooks + failures + preferences + user facts)
     const detectedApp = this._detectAppFromText(text);
-    if (detectedApp) {
-      memoryTips = this.memory.getTipsForApp(detectedApp);
-    }
+    const memoryContext = this.memory.buildContextForPrompt(detectedApp, text);
 
-    const contextText = memoryTips ? `${ctx}\n\n${memoryTips}` : ctx;
+    const contextText = memoryContext ? `${ctx}\n\n${memoryContext}` : ctx;
     const content = [
       { type: 'text', text },
       { type: 'text', text: contextText },
@@ -350,10 +348,12 @@ class Agent {
         return { text: textParts.join('\n') || 'Done.' };
       }
 
-      // Forward non-narration text to user
+      // Filter narration — Jarvis should act silently on trivial tasks
       if (textParts.length > 0) {
         const combined = textParts.join('\n').trim();
-        if (combined && !combined.match(/^(let me|i('ll| will)|now i|ok(ay)?[,.]?\s*(let|i)|trying to|sure[,!]?\s*(let|i))/i)) {
+        // Kill ALL filler phrases — these waste voice time
+        const isNarration = /^(let me|i('ll| will)|now i|ok(ay)?[,.]?\s|trying to|sure[,!]?\s|i('m| am) going|i can see|i need to|i see |looking at|it looks like|good[,!]|perfect[,!]|great[,!]|alright[,!]|excellent)/i.test(combined);
+        if (combined && !isNarration) {
           this.onProgress({ type: 'text', text: combined });
         }
       }
@@ -578,6 +578,19 @@ class Agent {
       if (this._retryCount >= 3 && this._currentModel !== MODEL_ACCURATE) {
         console.log('[agent] Screen unchanged after actions — upgrading to accurate model');
         this._currentModel = MODEL_ACCURATE;
+      }
+      // Self-learning: screen didn't change = action probably failed
+      if (this._retryCount >= 2 && this._currentActions.length > 0) {
+        const lastAction = this._currentActions[this._currentActions.length - 1];
+        const app = this._detectAppFromText(
+          this.history.find(m => m.role === 'user')?.content?.find?.(c => c.type === 'text')?.text || ''
+        );
+        if (app) {
+          this._recordFailure(app,
+            `${lastAction.tool}(${lastAction.input?.action || ''})`,
+            'screen unchanged after action',
+            'try different approach or keyboard shortcut');
+        }
       }
     } else {
       this._retryCount = 0;
@@ -900,10 +913,25 @@ class Agent {
     const userText = firstUserMsg.content?.find?.((c) => c.type === 'text')?.text || '';
     if (!userText) return;
     const app = this._detectAppFromText(userText);
+    const elapsed = this._chatStartTime ? Date.now() - this._chatStartTime : 0;
     try {
-      this.memory.recordSuccess(userText, app, this._currentActions.slice(0, 10));
+      this.memory.recordSuccess(userText, app, this._currentActions.slice(0, 15), elapsed);
+      console.log(`[memory] Saved playbook: "${userText.slice(0, 40)}" → ${this._currentActions.length} actions, ${Math.round(elapsed / 1000)}s`);
     } catch (err) {
       console.error('[agent] memory save error:', err.message);
+    }
+  }
+
+  /**
+   * Record when an action didn't produce the expected result.
+   * Called by specific handlers when they detect failure conditions.
+   */
+  _recordFailure(app, action, outcome, fix) {
+    try {
+      this.memory.recordFailure(app, action, outcome, fix);
+      console.log(`[memory] Failure recorded: ${app}/${action} → ${outcome}`);
+    } catch (err) {
+      console.error('[agent] failure record error:', err.message);
     }
   }
 }
